@@ -1,0 +1,11 @@
+[Unit]
+Description=Jellyfin Hot Cache Manager
+Wants=network-online.target
+After=network-online.target jellyfin.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/jellyfin-hotcache --config /etc/jellyfin-hotcache.yml
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import shutil
@@ -246,9 +247,24 @@ def is_video_file(path: Path, extensions: set[str]) -> bool:
     return path.is_file() and path.suffix.lower() in extensions
 
 
+def logical_path(path: Path) -> Path:
+    """Return an absolute normalized path without dereferencing symlinks."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def is_within(path: Path, parent: Path) -> bool:
+    """Test logical pathname containment without following symlinks."""
     try:
-        path.resolve().relative_to(parent.resolve())
+        logical_path(path).relative_to(logical_path(parent))
+        return True
+    except ValueError:
+        return False
+
+
+def is_within_physical(path: Path, parent: Path) -> bool:
+    """Test physical containment, following existing symlinks."""
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
         return True
     except ValueError:
         return False
@@ -256,12 +272,9 @@ def is_within(path: Path, parent: Path) -> bool:
 
 def safe_relative_path(source_file: Path, library_root: Path) -> Path:
     try:
-        return source_file.resolve().relative_to(library_root.resolve())
+        return logical_path(source_file).relative_to(logical_path(library_root))
     except ValueError:
-        try:
-            return source_file.absolute().relative_to(library_root.absolute())
-        except ValueError:
-            raise RuntimeError(f"Source is outside configured library root: {source_file}")
+        raise RuntimeError(f"Source is outside configured library root: {source_file}")
 
 
 def find_matching_library(source_file: Path, libraries: list[Library]) -> Optional[Library]:
@@ -335,9 +348,26 @@ def set_group_permissions(path: Path, file_mode: int = 0o664, dir_mode: int = 0o
             pass
 
 
+def get_jellyfin_api_key(config: dict[str, Any]) -> str:
+    jellyfin_cfg = config.get("jellyfin", {}) or {}
+    env_name = str(jellyfin_cfg.get("api_key_env") or "").strip()
+    if env_name:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+
+    value = str(jellyfin_cfg.get("api_key") or "").strip()
+    if value:
+        return value
+
+    if env_name:
+        raise RuntimeError(f"Jellyfin API key environment variable is not set: {env_name}")
+    raise RuntimeError("Jellyfin API key is not configured")
+
+
 def jellyfin_get(config: dict[str, Any], endpoint: str, params: dict[str, Any] | None = None) -> Any:
     base_url = config["jellyfin"]["url"].rstrip("/")
-    api_key = config["jellyfin"]["api_key"]
+    api_key = get_jellyfin_api_key(config)
 
     url = base_url + endpoint
     if params:
@@ -402,15 +432,14 @@ def get_item_from_jellyfin(
 
 
 def get_active_paths(config: dict[str, Any]) -> set[str]:
+    """Return logical media paths for active sessions. API failures are fatal."""
     active: set[str] = set()
+    sessions = jellyfin_get(config, "/Sessions")
 
-    try:
-        sessions = jellyfin_get(config, "/Sessions") or []
-    except Exception:
-        return active
-
+    if sessions is None:
+        sessions = []
     if not isinstance(sessions, list):
-        return active
+        raise RuntimeError("Jellyfin /Sessions returned an unexpected response")
 
     for session in sessions:
         now_playing = session.get("NowPlayingItem") if isinstance(session, dict) else None
@@ -418,7 +447,7 @@ def get_active_paths(config: dict[str, Any]) -> set[str]:
             continue
         path = now_playing.get("Path")
         if path:
-            active.add(str(Path(path).resolve()))
+            active.add(str(logical_path(Path(path))))
 
     return active
 
@@ -841,26 +870,40 @@ def query_playback_reporting_postgresql(
             q_base_path = _quote_pg_ident(base_path_col)
             q_base_name = _quote_pg_ident(base_name_col) if base_name_col else None
 
-            user_expr = f"MIN(ud.{q_user}::text)" if q_user else "NULL"
-            title_expr = f"MIN(bi.{q_base_name}::text)" if q_base_name else f"MIN(ud.{q_item}::text)"
-            plays_expr = f"COALESCE(SUM(ud.{q_play_count}), 0)"
+            if not q_user:
+                raise RuntimeError(f"Could not find UserId column in table {schema}.{table_name}")
 
+            title_expr = f"MIN(bi.{q_base_name}::text)" if q_base_name else "MIN(pu.item_id)"
+
+            # UserData may contain several rows for the same item/user under
+            # different CustomDataKey values (for example provider IDs). Those
+            # rows mirror the same play state and must not be summed as separate
+            # plays. Collapse to one row per item/user with MAX(PlayCount), then
+            # sum across users for the household-level promotion threshold.
             sql = f"""
-                SELECT ud.{q_item}::text AS item_id,
-                       {user_expr} AS user_id,
+                WITH per_user AS (
+                    SELECT ud.{q_item}::text AS item_id,
+                           ud.{q_user}::text AS user_id,
+                           MAX(COALESCE(ud.{q_play_count}, 0)) AS plays,
+                           MAX(ud.{q_date}) AS last_played
+                    FROM {q_ud_schema}.{q_ud_table} ud
+                    WHERE ud.{q_date} >= %s
+                      AND COALESCE(ud.{q_play_count}, 0) > 0
+                    GROUP BY ud.{q_item}, ud.{q_user}
+                )
+                SELECT pu.item_id,
+                       MIN(pu.user_id) AS user_id,
                        {title_expr} AS title,
-                       {plays_expr} AS plays,
-                       MAX(ud.{q_date}) AS last_played,
+                       COALESCE(SUM(pu.plays), 0) AS plays,
+                       MAX(pu.last_played) AS last_played,
                        MIN(bi.{q_base_path}::text) AS path
-                FROM {q_ud_schema}.{q_ud_table} ud
+                FROM per_user pu
                 JOIN {q_base_schema}.{q_base_table} bi
-                  ON ud.{q_item} = bi.{q_base_id}
-                WHERE ud.{q_date} >= %s
-                  AND COALESCE(ud.{q_play_count}, 0) > 0
-                  AND bi.{q_base_path} IS NOT NULL
+                  ON pu.item_id = bi.{q_base_id}::text
+                WHERE bi.{q_base_path} IS NOT NULL
                   AND bi.{q_base_path}::text <> ''
-                GROUP BY ud.{q_item}
-                HAVING {plays_expr} > 0
+                GROUP BY pu.item_id
+                HAVING COALESCE(SUM(pu.plays), 0) > 0
                 ORDER BY plays DESC, last_played DESC
             """
         else:
@@ -993,12 +1036,9 @@ def can_promote_file(
     projected_music_used: int = 0,
     projected_video_used: int = 0,
 ) -> tuple[bool, str]:
-    try:
-        resolved_source = str(source_file.resolve())
-    except FileNotFoundError:
-        resolved_source = str(source_file.absolute())
+    source_identity = str(logical_path(source_file))
 
-    if resolved_source in active_paths:
+    if source_identity in active_paths:
         return False, "file is currently being streamed"
 
     if not source_file.exists():
@@ -1017,7 +1057,7 @@ def can_promote_file(
     if preserved_original.exists() or preserved_original.is_symlink():
         return False, f"preserved original sidecar already exists: {preserved_original}"
 
-    if not is_within(cache_file.parent, cache_root):
+    if not is_within_physical(cache_file.parent, cache_root):
         return False, "cache destination is outside cache root"
 
     file_size = source_file.stat().st_size
@@ -1178,12 +1218,9 @@ def demote_cold_files(
         if last_seen_hot > cutoff:
             continue
 
-        try:
-            resolved_source = str(source.resolve())
-        except FileNotFoundError:
-            resolved_source = str(source.absolute())
+        source_identity = str(logical_path(source))
 
-        if resolved_source in active_paths:
+        if source_identity in active_paths:
             actions.append(Action(
                 status="SKIPPED DEMOTE",
                 title=title,
@@ -1322,12 +1359,9 @@ def restore_all_cached_files(
             ))
             continue
 
-        try:
-            resolved_source = str(source.resolve())
-        except FileNotFoundError:
-            resolved_source = str(source.absolute())
+        source_identity = str(logical_path(source))
 
-        if skip_active and resolved_source in active_paths:
+        if skip_active and source_identity in active_paths:
             actions.append(Action(
                 status="SKIPPED RESTORE",
                 title=title,
@@ -1612,6 +1646,20 @@ def send_report(config: dict[str, Any], body: str, started_at: str) -> None:
         raise RuntimeError(f"sendmail failed with exit code {proc.returncode}")
 
 
+def acquire_run_lock(config: dict[str, Any]):
+    """Acquire a non-blocking process lock and hold it for the caller's lifetime."""
+    hotcache_cfg = config.get("hotcache", {}) or {}
+    lock_path = Path(hotcache_cfg.get("lock_file", "/run/lock/jellyfin-hotcache.lock"))
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        lock_fh.close()
+        raise RuntimeError(f"another jellyfin-hotcache run is already active: {lock_path}") from exc
+    return lock_fh
+
+
 def validate_config(config: dict[str, Any]) -> None:
     required = [
         ("cache", "root"),
@@ -1626,10 +1674,25 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise RuntimeError(f"Missing required config key: {'.'.join(path)}")
             cursor = cursor[key]
 
-    if config["cache"].get("allow_directory_promotion", False):
+    cache_cfg = config["cache"]
+    if cache_cfg.get("allow_directory_promotion", False):
         raise RuntimeError(
             "allow_directory_promotion is true. This script is intentionally "
             "file-first; review code before enabling directory promotion."
+        )
+
+    if cache_cfg.get("promotion_mode", "main_file_only") != "main_file_only":
+        raise RuntimeError("Only cache.promotion_mode=main_file_only is supported")
+
+    if not cache_cfg.get("preserve_original_on_source", True):
+        raise RuntimeError(
+            "cache.preserve_original_on_source=false is unsupported; "
+            "the current safety model requires preserving the NAS original"
+        )
+
+    if not cache_cfg.get("use_absolute_symlinks", True):
+        raise RuntimeError(
+            "cache.use_absolute_symlinks=false is unsupported by the current implementation"
         )
 
 
@@ -1655,6 +1718,12 @@ def main() -> int:
     config_path = Path(args.config)
     config = load_config(config_path)
     validate_config(config)
+
+    if not bool(config.get("hotcache", {}).get("enabled", True)):
+        print("Jellyfin hotcache is disabled by hotcache.enabled=false")
+        return 0
+
+    run_lock = acquire_run_lock(config)
 
     started_at = now_iso()
     cache_cfg = config["cache"]
@@ -1729,7 +1798,12 @@ def main() -> int:
 
         active_paths = set()
         if cache_cfg.get("skip_if_active_stream", True):
-            active_paths = get_active_paths(config)
+            try:
+                active_paths = get_active_paths(config)
+            except Exception as exc:
+                raise RuntimeError(
+                    "could not verify active Jellyfin streams; refusing a mutating run"
+                ) from exc
 
         candidates: list[Candidate] = []
         if cache_cfg.get("enable_promotion", True):
@@ -1857,6 +1931,8 @@ def main() -> int:
         if not dry_run:
             save_manifest(manifest_path, manifest)
 
+    except Exception as exc:
+        report.errors.append(f"Run aborted: {exc}")
     finally:
         report.cache_used_after = directory_size(cache_root)
         if not report.projected_cache_used:
@@ -1866,7 +1942,7 @@ def main() -> int:
         print(body)
 
         if args.no_email:
-            return 0
+            return 1 if report.errors else 0
 
         try:
             send_report(config, body, started_at)

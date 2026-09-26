@@ -1,10 +1,12 @@
 [Unit]
 Description=Jellyfin Hot Cache Manager
 Wants=network-online.target
-After=network-online.target jellyfin.service
+After=network-online.target local-fs.target
+RequiresMountsFor=/mnt/nest /mnt/cache
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/jellyfin-hotcache.env
 ExecStart=/usr/local/sbin/jellyfin-hotcache --config /etc/jellyfin-hotcache.yml
 Nice=10
 IOSchedulingClass=best-effort

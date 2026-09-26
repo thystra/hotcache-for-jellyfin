@@ -1,0 +1,50 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "configure" ] && [ ! -e /etc/jellyfin-hotcache/config.yml ]; then
+    cat <<'MSG'
+
+Jellyfin Hotcache is installed but is not yet configured.
+
+Create the operator-owned configuration with:
+
+  sudo cp /usr/share/jellyfin-hotcache/config.yml.example \
+      /etc/jellyfin-hotcache/config.yml
+  sudo chmod 0600 /etc/jellyfin-hotcache/config.yml
+
+Secrets may be stored in:
+
+  /etc/jellyfin-hotcache/environment
+
+That file is operator-owned and is never supplied or overwritten by the package.
+
+Before enabling the timer, run:
+
+  sudo jellyfin-hotcache --check
+
+The timer is intentionally not enabled or started automatically.
+
+MSG
+fi
+
+if [ "$1" = "configure" ] && { \
+    [ -e /usr/local/sbin/jellyfin-hotcache ] || \
+    [ -e /etc/systemd/system/jellyfin-hotcache.service ] || \
+    [ -e /etc/systemd/system/jellyfin-hotcache.timer ]; \
+}; then
+    cat <<'MSG'
+
+WARNING: legacy Jellyfin Hotcache installation files were detected.
+
+Legacy files are not removed automatically. In particular, units under
+/etc/systemd/system override the package-managed units under
+/usr/lib/systemd/system, and /usr/local/sbin may take precedence over /usr/sbin
+in PATH. See /usr/share/doc/jellyfin-hotcache/README.Debian before enabling the
+packaged timer.
+
+MSG
+fi
+
+exit 0

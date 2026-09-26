@@ -1,0 +1,4 @@
+jellyfin-hotcache usr/sbin/
+config/config.yml.example usr/share/jellyfin-hotcache/
+service/jellyfin-hotcache.service usr/lib/systemd/system/
+service/jellyfin-hotcache.timer usr/lib/systemd/system/

@@ -1,0 +1,30 @@
+Source: jellyfin-hotcache
+Section: utils
+Priority: optional
+Maintainer: Alan <alan@argentwolf.org>
+Build-Depends:
+ debhelper-compat (= 13),
+ python3,
+ python3-pytest,
+ python3-yaml
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://forgejo.argentwolf.org/alan/linux-jellyfin-hotcache
+Vcs-Git: https://forgejo.argentwolf.org/alan/linux-jellyfin-hotcache.git
+Vcs-Browser: https://forgejo.argentwolf.org/alan/linux-jellyfin-hotcache
+
+Package: jellyfin-hotcache
+Architecture: all
+Depends:
+ python3,
+ python3-yaml,
+ python3-psycopg2,
+ ${misc:Depends}
+Suggests: default-mta | mail-transport-agent
+Description: safety-oriented local media hot cache for Jellyfin
+ Jellyfin Hotcache promotes selected media files from slower storage to a
+ faster local cache while preserving Jellyfin's original media paths.
+ .
+ It includes playback-aware promotion and demotion, PostgreSQL and SQLite
+ playback-history support, active-stream protection, preserved source
+ originals, manifest tracking, locking, and a read-only preflight mode.

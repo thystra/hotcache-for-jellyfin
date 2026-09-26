@@ -1,0 +1,35 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Jellyfin Hotcache
+Source: https://forgejo.argentwolf.org/alan/linux-jellyfin-hotcache
+
+Files: .gitignore
+ README.md
+ jellyfin-hotcache
+ pytest.ini
+ requirements-dev.txt
+ config/*
+ service/*
+ tests/*
+ debian/*
+Copyright: 2026 Alan <alan@argentwolf.org>
+License: GPL-3+
+
+Files: LICENSE
+Copyright: 2007 Free Software Foundation, Inc. <https://fsf.org/>
+License: FSF-GPL-license-text
+ Everyone is permitted to copy and distribute verbatim copies of this
+ license document, but changing it is not allowed.
+
+License: GPL-3+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of version 3 of the GNU General
+ Public License can be found in /usr/share/common-licenses/GPL-3.

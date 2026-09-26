@@ -1,0 +1,10 @@
+b8ec19a01b02b14c411364668bfa789c  usr/lib/systemd/system/jellyfin-hotcache.service
+098b79ca5dfe1c58bf0516ca43e71d6f  usr/lib/systemd/system/jellyfin-hotcache.timer
+370b64c81912f6f5c268d27692490197  usr/sbin/jellyfin-hotcache
+5c4867f59a35a1ae3990b1e3b52d8a6a  usr/share/doc/jellyfin-hotcache/README.Debian
+c02c0dde13b1ba6690d4d3e8b22c6f8a  usr/share/doc/jellyfin-hotcache/README.md
+eb100c02974171eef4540bc245605145  usr/share/doc/jellyfin-hotcache/changelog.Debian.gz
+b847c1a3c1458a5eb397c62b8f11205c  usr/share/doc/jellyfin-hotcache/copyright
+eb9ef1e172f00c554c376a5d3c51b5f8  usr/share/jellyfin-hotcache/config.yml.example
+0a2ab5c6e7c2f5aa3252e61089e9d2e7  usr/share/lintian/overrides/jellyfin-hotcache
+b344416ba09299c5923dd69f9cd6fbf6  usr/share/man/man8/jellyfin-hotcache.8.gz

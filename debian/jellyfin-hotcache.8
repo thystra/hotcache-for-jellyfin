@@ -1,0 +1,77 @@
+.TH JELLYFIN-HOTCACHE 8 "September 2026" "jellyfin-hotcache 1.0.0" "System Administration"
+.SH NAME
+jellyfin\-hotcache \- manage a safety-oriented local media cache for Jellyfin
+.SH SYNOPSIS
+.B jellyfin-hotcache
+.RI [ options ]
+.SH DESCRIPTION
+.B jellyfin-hotcache
+promotes selected media files from slower storage to a local cache while
+keeping Jellyfin's configured media paths stable with symbolic links.
+The source-side original is preserved so a cached item can be restored without
+copying it back from the cache.
+.PP
+Normal mutating runs fail closed when active Jellyfin sessions or playback
+history cannot be checked. The configured cache root must already exist; the
+program will not create a missing cache root because that can conceal a missing
+mount.
+.SH OPTIONS
+.TP
+.BR \-\-config " " FILE
+Read configuration from
+.IR FILE .
+The default is
+.IR /etc/jellyfin-hotcache/config.yml .
+.TP
+.B \-\-check
+Run the read-only preflight and exit. The preflight checks configuration,
+Jellyfin API access, playback database connectivity and schema, configured
+libraries, cache limits and free space, lock availability, manifest entries,
+cache containment, symlink targets, preserved originals, and orphan cache
+files. It does not promote, demote, or restore files and does not create the
+cache root, lock file, report, or manifest.
+.TP
+.B \-\-dry-run
+Force dry-run behavior regardless of the configuration setting.
+.TP
+.B \-\-no-email
+Do not send the run report by email.
+.SH FILES
+.TP
+.I /etc/jellyfin-hotcache/config.yml
+Operator-owned YAML configuration. The Debian package never installs or
+overwrites this file.
+.TP
+.I /etc/jellyfin-hotcache/environment
+Optional operator-owned environment file for secrets such as
+.B JELLYFIN_API_KEY
+and
+.BR JELLYFIN_PG_PASSWORD .
+.TP
+.I /usr/share/jellyfin-hotcache/config.yml.example
+Package-managed reference configuration.
+.TP
+.I /run/lock/jellyfin-hotcache.lock
+Default run lock path.
+.SH EXIT STATUS
+.TP
+.B 0
+Successful normal run, or a preflight with no FAIL results.
+.TP
+.B 1
+One or more operational failures.
+.TP
+.B 2
+Configuration or command setup error. Normal report-delivery failures may also
+use this status.
+.SH SYSTEMD
+The package installs
+.B jellyfin-hotcache.service
+and
+.BR jellyfin-hotcache.timer .
+The timer is deliberately not enabled or started on first installation.
+Site-specific mount dependencies should be added with a local systemd drop-in.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR systemd.service (5),
+.BR systemd.timer (5)

@@ -1646,6 +1646,31 @@ def send_report(config: dict[str, Any], body: str, started_at: str) -> None:
         raise RuntimeError(f"sendmail failed with exit code {proc.returncode}")
 
 
+def finish_run(
+    config: dict[str, Any],
+    report: RunReport,
+    started_at: str,
+    no_email: bool,
+) -> int:
+    """Print/save/send the run report and return a stable process exit code."""
+    body = build_report_text(config, report)
+    print(body)
+
+    email_failed = False
+    if not no_email:
+        try:
+            send_report(config, body, started_at)
+        except Exception as exc:
+            email_failed = True
+            print(f"WARNING: report email failed: {exc}", file=sys.stderr)
+
+    if report.errors:
+        return 1
+    if email_failed:
+        return 2
+    return 0
+
+
 def acquire_run_lock(config: dict[str, Any]):
     """Acquire a non-blocking process lock and hold it for the caller's lifetime."""
     hotcache_cfg = config.get("hotcache", {}) or {}
@@ -1700,7 +1725,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Jellyfin hot-cache manager")
     parser.add_argument(
         "--config",
-        default="/etc/jellyfin-hotcache.yml",
+        default="/etc/jellyfin-hotcache/config.yml",
         help="Path to YAML config file",
     )
     parser.add_argument(
@@ -1776,18 +1801,8 @@ def main() -> int:
 
         except Exception as exc:
             report.errors.append(f"Restore-all-and-disable failed: {exc}")
-        finally:
-            body = build_report_text(config, report)
-            print(body)
-            if args.no_email:
-                return 1 if report.errors else 0
-            try:
-                send_report(config, body, started_at)
-            except Exception as exc:
-                print(f"WARNING: report email failed: {exc}", file=sys.stderr)
-                return 2 if report.errors else 0
 
-        return 1 if report.errors else 0
+        return finish_run(config, report, started_at, args.no_email)
 
     try:
         libraries = build_libraries(config)
@@ -1933,24 +1948,13 @@ def main() -> int:
 
     except Exception as exc:
         report.errors.append(f"Run aborted: {exc}")
-    finally:
-        report.cache_used_after = directory_size(cache_root)
-        if not report.projected_cache_used:
-            report.projected_cache_used = report.cache_used_after
-        report.filesystem_free = shutil.disk_usage(cache_root).free
-        body = build_report_text(config, report)
-        print(body)
 
-        if args.no_email:
-            return 1 if report.errors else 0
+    report.cache_used_after = directory_size(cache_root)
+    if not report.projected_cache_used:
+        report.projected_cache_used = report.cache_used_after
+    report.filesystem_free = shutil.disk_usage(cache_root).free
 
-        try:
-            send_report(config, body, started_at)
-        except Exception as exc:
-            print(f"WARNING: report email failed: {exc}", file=sys.stderr)
-            return 2 if report.errors else 0
-
-    return 1 if report.errors else 0
+    return finish_run(config, report, started_at, args.no_email)
 
 
 if __name__ == "__main__":

@@ -104,6 +104,13 @@ class RunReport:
     projected_cache_used: int = 0
 
 
+@dataclass
+class CheckResult:
+    status: str
+    name: str
+    detail: str
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -1685,6 +1692,283 @@ def acquire_run_lock(config: dict[str, Any]):
     return lock_fh
 
 
+def _check_result(results: list[CheckResult], status: str, name: str, detail: str) -> None:
+    results.append(CheckResult(status=status, name=name, detail=detail))
+
+
+def _check_lock_readonly(config: dict[str, Any], results: list[CheckResult]) -> None:
+    hotcache_cfg = config.get("hotcache", {}) or {}
+    lock_path = Path(hotcache_cfg.get("lock_file", "/run/lock/jellyfin-hotcache.lock"))
+
+    if not lock_path.exists():
+        parent = lock_path.parent
+        if parent.exists() and os.access(parent, os.W_OK | os.X_OK):
+            _check_result(results, "PASS", "run lock", f"available; lock file absent: {lock_path}")
+        else:
+            _check_result(results, "FAIL", "run lock", f"lock directory is not writable: {parent}")
+        return
+
+    try:
+        with lock_path.open("r+") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                _check_result(results, "FAIL", "run lock", f"another run holds {lock_path}")
+                return
+            finally:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        _check_result(results, "PASS", "run lock", f"available: {lock_path}")
+    except OSError as exc:
+        _check_result(results, "FAIL", "run lock", f"cannot inspect {lock_path}: {exc}")
+
+
+def _check_postgresql_readonly(config: dict[str, Any], results: list[CheckResult]) -> None:
+    playback = config.get("playback_reporting", {}) or {}
+    conn = None
+    try:
+        conn, driver = _connect_postgresql(playback)
+        cur = conn.cursor()
+        cur.execute("SELECT current_database(), current_user")
+        database, user = cur.fetchone()
+        _check_result(results, "PASS", "PostgreSQL connection", f"{database} as {user} via {driver}")
+
+        required = {
+            "UserData": {"itemid", "userid", "playcount", "lastplayeddate"},
+            "BaseItems": {"id", "path"},
+        }
+        for table_name, required_columns in required.items():
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND lower(table_name) = lower(%s)
+                """,
+                (table_name,),
+            )
+            columns = {str(row[0]).lower() for row in cur.fetchall()}
+            missing = sorted(required_columns - columns)
+            if missing:
+                _check_result(
+                    results,
+                    "FAIL",
+                    f"PostgreSQL {table_name} schema",
+                    "missing columns: " + ", ".join(missing),
+                )
+            else:
+                _check_result(results, "PASS", f"PostgreSQL {table_name} schema", "compatible")
+    except Exception as exc:
+        _check_result(results, "FAIL", "PostgreSQL connection", str(exc))
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _check_sqlite_readonly(config: dict[str, Any], results: list[CheckResult]) -> None:
+    playback = config.get("playback_reporting", {}) or {}
+    db_path = Path(playback.get("database_path", ""))
+    if not db_path.exists():
+        _check_result(results, "FAIL", "SQLite playback database", f"not found: {db_path}")
+        return
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        finally:
+            con.close()
+        _check_result(results, "PASS", "SQLite playback database", f"readable; {len(rows)} tables")
+    except Exception as exc:
+        _check_result(results, "FAIL", "SQLite playback database", str(exc))
+
+
+def _symlink_target(path: Path) -> Path:
+    target = Path(os.readlink(path))
+    if not target.is_absolute():
+        target = path.parent / target
+    return target.resolve(strict=False)
+
+
+def run_preflight(config: dict[str, Any]) -> int:
+    """Run read-only operational checks. Never create, repair, or rewrite state."""
+    results: list[CheckResult] = []
+
+    if bool(config.get("hotcache", {}).get("enabled", True)):
+        _check_result(results, "PASS", "configuration", "valid; hotcache enabled")
+    else:
+        _check_result(results, "WARN", "configuration", "valid; hotcache.enabled=false")
+
+    try:
+        key = get_jellyfin_api_key(config)
+        _check_result(results, "PASS", "Jellyfin API key", f"configured ({len(key)} characters)")
+        active_paths = get_active_paths(config)
+        _check_result(results, "PASS", "Jellyfin /Sessions", f"accessible; {len(active_paths)} active media paths")
+    except Exception as exc:
+        _check_result(results, "FAIL", "Jellyfin /Sessions", str(exc))
+
+    source_mode = str(config.get("playback_reporting", {}).get("source", "sqlite")).lower()
+    if source_mode in {"postgresql", "postgres", "pg"}:
+        _check_result(results, "PASS", "playback source", "PostgreSQL")
+        _check_postgresql_readonly(config, results)
+    elif source_mode == "sqlite":
+        _check_result(results, "PASS", "playback source", "SQLite")
+        _check_sqlite_readonly(config, results)
+    else:
+        _check_result(results, "FAIL", "playback source", f"unsupported source: {source_mode}")
+
+    try:
+        libraries = build_libraries(config)
+    except Exception as exc:
+        libraries = []
+        _check_result(results, "FAIL", "libraries", str(exc))
+
+    for library in libraries:
+        if not library.source.exists():
+            _check_result(results, "FAIL", f"library {library.name}", f"not found: {library.source}")
+        elif not library.source.is_dir():
+            _check_result(results, "FAIL", f"library {library.name}", f"not a directory: {library.source}")
+        elif not os.access(library.source, os.R_OK | os.X_OK):
+            _check_result(results, "FAIL", f"library {library.name}", f"not readable: {library.source}")
+        else:
+            _check_result(results, "PASS", f"library {library.name}", str(library.source))
+
+    cache_cfg = config["cache"]
+    cache_root = Path(cache_cfg["root"])
+    cache_available = False
+    if not cache_root.exists():
+        _check_result(results, "FAIL", "cache root", f"not found: {cache_root}")
+    elif not cache_root.is_dir():
+        _check_result(results, "FAIL", "cache root", f"not a directory: {cache_root}")
+    elif not os.access(cache_root, os.R_OK | os.W_OK | os.X_OK):
+        _check_result(results, "FAIL", "cache root", f"not readable/writable: {cache_root}")
+    else:
+        cache_available = True
+        usage = shutil.disk_usage(cache_root)
+        used = directory_size(cache_root)
+        limit = parse_size(cache_cfg.get("max_cache_size", "50GB"))
+        minimum_free = parse_size(cache_cfg.get("minimum_free_cache_space", "5GB"))
+        _check_result(results, "PASS", "cache root", str(cache_root))
+        if used > limit:
+            _check_result(results, "FAIL", "cache limit", f"used {human_size(used)} exceeds limit {human_size(limit)}")
+        else:
+            _check_result(results, "PASS", "cache limit", f"used {human_size(used)} of {human_size(limit)}")
+        if usage.free < minimum_free:
+            _check_result(results, "FAIL", "cache free space", f"{human_size(usage.free)} free; requires {human_size(minimum_free)}")
+        else:
+            _check_result(results, "PASS", "cache free space", human_size(usage.free))
+
+        try:
+            cache_dev = cache_root.stat().st_dev
+            for library in libraries:
+                if library.source.exists() and library.source.stat().st_dev == cache_dev:
+                    _check_result(
+                        results,
+                        "WARN",
+                        f"filesystem {library.name}",
+                        "library and cache report the same device; verify cache is on the intended filesystem",
+                    )
+        except OSError as exc:
+            _check_result(results, "WARN", "filesystem identity", str(exc))
+
+    _check_lock_readonly(config, results)
+
+    manifest_path = cache_root / "manifest.json"
+    manifest: dict[str, Any] = {"version": 1, "items": {}}
+    if manifest_path.exists():
+        try:
+            manifest = load_manifest(manifest_path)
+            items = manifest.get("items", {})
+            if not isinstance(items, dict):
+                raise RuntimeError("manifest.items is not an object")
+            _check_result(results, "PASS", "manifest", f"{len(items)} entries: {manifest_path}")
+        except Exception as exc:
+            _check_result(results, "FAIL", "manifest", str(exc))
+            items = {}
+    else:
+        items = {}
+        _check_result(results, "WARN", "manifest", f"not present: {manifest_path}")
+
+    tracked_cache_paths: set[str] = set()
+    for source_str, entry in items.items():
+        if not isinstance(entry, dict):
+            _check_result(results, "FAIL", "manifest entry", f"non-object entry for {source_str}")
+            continue
+        source = Path(source_str)
+        cache_value = str(entry.get("cache") or "")
+        if not cache_value:
+            _check_result(results, "FAIL", "manifest entry", f"missing cache path for {source}")
+            continue
+        cache = Path(cache_value)
+        tracked_cache_paths.add(str(cache.resolve(strict=False)))
+
+        library = find_matching_library(source, libraries)
+        if library is None:
+            _check_result(results, "FAIL", "manifest library", f"source is outside configured libraries: {source}")
+
+        if cache_available and not is_within_physical(cache, cache_root):
+            _check_result(results, "FAIL", "manifest cache path", f"outside cache root: {cache}")
+            continue
+
+        if source.is_symlink():
+            target = _symlink_target(source)
+            expected = cache.resolve(strict=False)
+            if target != expected:
+                _check_result(results, "FAIL", "cached symlink", f"{source} -> {target}; expected {expected}")
+            elif not cache.exists():
+                _check_result(results, "FAIL", "cached symlink", f"dangling cache target: {source} -> {cache}")
+            else:
+                _check_result(results, "PASS", "cached symlink", f"{source} -> {cache}")
+
+            preserved = Path(entry.get("preserved_original") or original_sidecar_path(source, config))
+            if not preserved.exists() or preserved.is_symlink():
+                _check_result(results, "FAIL", "preserved original", f"missing regular file: {preserved}")
+            elif cache.exists() and preserved.stat().st_size != cache.stat().st_size:
+                _check_result(results, "FAIL", "preserved original", f"size mismatch: {preserved}")
+            else:
+                _check_result(results, "PASS", "preserved original", str(preserved))
+        elif source.exists() and cache.exists():
+            _check_result(results, "FAIL", "manifest state", f"source is regular but cache still exists: {source}")
+        elif source.exists() and not cache.exists():
+            _check_result(results, "WARN", "stale manifest entry", f"source already restored: {source}")
+        elif not source.exists() and not source.is_symlink():
+            _check_result(results, "FAIL", "manifest source", f"source missing: {source}")
+
+    if cache_available:
+        orphan_count = 0
+        for root, dirs, files in os.walk(cache_root):
+            root_path = Path(root)
+            if root_path == cache_root:
+                dirs[:] = [d for d in dirs if d != "reports"]
+            for name in files:
+                path = root_path / name
+                if path == manifest_path or path.is_symlink():
+                    continue
+                if str(path.resolve(strict=False)) not in tracked_cache_paths:
+                    orphan_count += 1
+        if orphan_count:
+            _check_result(results, "WARN", "orphan cache files", f"{orphan_count} untracked files")
+        else:
+            _check_result(results, "PASS", "orphan cache files", "0")
+
+    print("Jellyfin Hotcache preflight")
+    print()
+    for result in results:
+        print(f"{result.status:<5} {result.name:<28} {result.detail}")
+
+    failures = sum(1 for result in results if result.status == "FAIL")
+    warnings = sum(1 for result in results if result.status == "WARN")
+    print()
+    if failures:
+        print(f"CHECK: FAIL ({failures} failures, {warnings} warnings)")
+        return 1
+    print(f"CHECK: PASS ({warnings} warnings)")
+    return 0
+
+
 def validate_config(config: dict[str, Any]) -> None:
     required = [
         ("cache", "root"),
@@ -1729,6 +2013,11 @@ def main() -> int:
         help="Path to YAML config file",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Run read-only preflight checks and exit",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Force dry-run regardless of config setting",
@@ -1741,8 +2030,18 @@ def main() -> int:
     args = parser.parse_args()
 
     config_path = Path(args.config)
-    config = load_config(config_path)
-    validate_config(config)
+    try:
+        config = load_config(config_path)
+        validate_config(config)
+    except Exception as exc:
+        if args.check:
+            print(f"FAIL  configuration                {exc}")
+            print("\nCHECK: FAIL (configuration error)")
+            return 2
+        raise
+
+    if args.check:
+        return run_preflight(config)
 
     if not bool(config.get("hotcache", {}).get("enabled", True)):
         print("Jellyfin hotcache is disabled by hotcache.enabled=false")
@@ -1754,7 +2053,11 @@ def main() -> int:
     cache_cfg = config["cache"]
     cache_root = Path(cache_cfg["root"])
 
-    mkdir_group_safe(cache_root)
+    if not cache_root.exists() or not cache_root.is_dir():
+        raise RuntimeError(
+            f"cache root is missing or is not a directory: {cache_root}; "
+            "refusing to create it because the cache mount may be absent"
+        )
     mkdir_group_safe(cache_root / "reports")
 
     dry_run = bool(cache_cfg.get("dry_run", True)) or args.dry_run
@@ -1831,8 +2134,9 @@ def main() -> int:
                 else:
                     candidates = discover_recent_candidates_fallback(config, libraries, extensions)
             except Exception as exc:
-                report.errors.append(f"Could not query playback history: {exc}")
-                candidates = discover_recent_candidates_fallback(config, libraries, extensions)
+                raise RuntimeError(
+                    "could not query playback history; refusing a mutating run"
+                ) from exc
 
         candidates = dedupe_candidates(candidates)
 

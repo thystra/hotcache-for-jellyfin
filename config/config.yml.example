@@ -74,7 +74,7 @@ cache:
   minimum_free_cache_space: "5GB"
 
   # Shipped default is dry-run. Set false only after reviewing reports.
-  dry_run: false
+  dry_run: true
 
   enable_promotion: true
 

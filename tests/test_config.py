@@ -25,3 +25,35 @@ def test_validate_config_rejects_unsafe_modes(hotcache, base_config, key, value,
     cfg["cache"][key] = value
     with pytest.raises(RuntimeError, match=match):
         hotcache.validate_config(cfg)
+
+def test_jellyfin_uses_modern_authorization_header(hotcache, monkeypatch):
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return b"[]"
+
+    def fake_urlopen(request, timeout=30):
+        captured.update(dict(request.header_items()))
+        return Response()
+
+    monkeypatch.setattr(hotcache.urllib.request, "urlopen", fake_urlopen)
+
+    config = {
+        "jellyfin": {
+            "url": "http://127.0.0.1:8096",
+            "api_key": "test-key",
+        }
+    }
+
+    assert hotcache.jellyfin_get(config, "/Sessions") == []
+
+    auth = captured.get("Authorization", "")
+    assert auth.startswith('MediaBrowser Token="test-key"')
+    assert "X-Emby-Token" not in captured

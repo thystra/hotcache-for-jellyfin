@@ -383,7 +383,13 @@ def jellyfin_get(config: dict[str, Any], endpoint: str, params: dict[str, Any] |
     request = urllib.request.Request(
         url,
         headers={
-            "X-Emby-Token": api_key,
+            "Authorization": (
+                f'MediaBrowser Token="{api_key}", '
+                'Client="jellyfin-hotcache", '
+                'Device="server", '
+                'DeviceId="jellyfin-hotcache", '
+                'Version="1.0"'
+            ),
             "Accept": "application/json",
         },
         method="GET",

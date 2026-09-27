@@ -2570,6 +2570,175 @@ def _symlink_target(path: Path) -> Path:
         target = path.parent / target
     return target.resolve(strict=False)
 
+def _find_jellyfin_process_pids(
+    config: dict[str, Any],
+    proc_root: Path = Path("/proc"),
+) -> list[int]:
+    """Return PIDs whose Linux process name matches the configured Jellyfin name."""
+    jellyfin_cfg = config.get("jellyfin", {}) or {}
+    process_name = str(jellyfin_cfg.get("process_name", "jellyfin")).strip()
+    if not process_name:
+        raise RuntimeError("jellyfin.process_name must not be empty")
+
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot inspect {proc_root} for Jellyfin processes: {exc}"
+        ) from exc
+
+    pids: list[int] = []
+    for proc_dir in entries:
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            comm = (proc_dir / "comm").read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            continue
+        if comm == process_name:
+            pids.append(int(proc_dir.name))
+
+    if not pids:
+        raise RuntimeError(
+            f"could not find a running Jellyfin process named {process_name!r}; "
+            "Hotcache cannot verify that absolute cache symlinks will be readable"
+        )
+
+    return sorted(pids)
+
+
+def _verify_jellyfin_process_cache_root(
+    pid: int,
+    cache_root: Path,
+    proc_root: Path = Path("/proc"),
+) -> str:
+    """
+    Verify one Jellyfin process sees the host cache directory at the same path.
+
+    This uses the process mount namespace through /proc/PID/root, so it works
+    for bare-metal Jellyfin as well as Docker/Podman/systemd-containerized
+    deployments without depending on a particular container runtime CLI.
+    """
+    process_root = proc_root / str(pid) / "root"
+    if not process_root.exists():
+        raise RuntimeError(f"Jellyfin process PID {pid} no longer exists")
+
+    desired = logical_path(cache_root)
+    visible = process_root / str(desired).lstrip("/")
+
+    try:
+        bare_metal = os.path.samefile(process_root, Path("/"))
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot inspect the mount namespace for Jellyfin PID {pid}: {exc}"
+        ) from exc
+
+    runtime = "bare-metal" if bare_metal else "containerized"
+    compose_hint = (
+        "If Jellyfin runs in Docker/Compose, add "
+        f"`{desired}:{desired}:ro` to the Jellyfin service volumes and "
+        "recreate the container."
+    )
+
+    if not visible.exists() or not visible.is_dir():
+        raise RuntimeError(
+            f"{runtime} Jellyfin PID {pid} cannot see cache root {desired} at "
+            "the same absolute path. Hotcache uses absolute symlink targets, "
+            f"so a promotion would make media unreadable. {compose_hint}"
+        )
+
+    try:
+        same_directory = os.path.samefile(visible, desired)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot compare Jellyfin-visible cache path {visible} with "
+            f"{desired}: {exc}"
+        ) from exc
+
+    if not same_directory:
+        raise RuntimeError(
+            f"{runtime} Jellyfin PID {pid} sees a different directory at "
+            f"{desired}. Hotcache uses absolute symlink targets, so Jellyfin "
+            "must see the same host cache directory at the same absolute path. "
+            f"{compose_hint}"
+        )
+
+    return runtime
+
+
+def verify_jellyfin_cache_visibility(
+    config: dict[str, Any],
+    cache_root: Path,
+    proc_root: Path = Path("/proc"),
+) -> tuple[str, str]:
+    """Verify the running Jellyfin process namespace can resolve cache targets."""
+    jellyfin_cfg = config.get("jellyfin", {}) or {}
+    if not bool(jellyfin_cfg.get("verify_cache_visibility", True)):
+        return (
+            "unchecked",
+            "disabled by jellyfin.verify_cache_visibility=false",
+        )
+
+    pids = _find_jellyfin_process_pids(config, proc_root=proc_root)
+    modes = {
+        _verify_jellyfin_process_cache_root(
+            pid,
+            cache_root,
+            proc_root=proc_root,
+        )
+        for pid in pids
+    }
+    mode = next(iter(modes)) if len(modes) == 1 else "mixed"
+    pid_text = ",".join(str(pid) for pid in pids)
+    return (
+        mode,
+        (
+            f"{mode}; PID(s) {pid_text} see {logical_path(cache_root)} "
+            "as the host cache directory"
+        ),
+    )
+
+
+def guard_promotion_cache_visibility(
+    config: dict[str, Any],
+    cache_root: Path,
+    *,
+    dry_run: bool,
+    proc_root: Path = Path("/proc"),
+) -> Optional[str]:
+    """
+    Fail closed before a real promotion if Jellyfin cannot resolve cache_root.
+
+    Dry-runs remain non-destructive and return a warning instead. Explicitly
+    disabling the guard also returns a warning so operators cannot miss that
+    Hotcache is proceeding without proving consumer visibility.
+    """
+    try:
+        visibility_mode, visibility_detail = verify_jellyfin_cache_visibility(
+            config,
+            cache_root,
+            proc_root=proc_root,
+        )
+    except Exception as exc:
+        if dry_run:
+            return (
+                "Jellyfin cache visibility check failed during dry-run: "
+                f"{exc} Real promotion will be refused until this is fixed."
+            )
+        raise RuntimeError(
+            f"Jellyfin cache visibility check failed: {exc} "
+            "Refusing to promote files because Jellyfin may not be able "
+            "to read the resulting absolute symlinks."
+        ) from exc
+
+    if visibility_mode == "unchecked":
+        return (
+            "Jellyfin cache visibility verification is disabled; Hotcache "
+            "cannot prove promoted absolute symlinks are readable by Jellyfin."
+        )
+
+    return None
+
 
 def run_preflight(config: dict[str, Any]) -> int:
     """Run read-only operational checks. Never create, repair, or rewrite state."""
@@ -2647,6 +2816,24 @@ def run_preflight(config: dict[str, Any]) -> int:
         limit = parse_size(cache_cfg.get("max_cache_size", "50GB"))
         minimum_free = parse_size(cache_cfg.get("minimum_free_cache_space", "5GB"))
         _check_result(results, "PASS", "cache root", str(cache_root))
+        try:
+            visibility_mode, visibility_detail = verify_jellyfin_cache_visibility(
+                config,
+                cache_root,
+            )
+            _check_result(
+                results,
+                "WARN" if visibility_mode == "unchecked" else "PASS",
+                "Jellyfin cache visibility",
+                visibility_detail,
+            )
+        except Exception as exc:
+            _check_result(
+                results,
+                "FAIL",
+                "Jellyfin cache visibility",
+                str(exc),
+            )
         _check_result(
             results,
             "PASS",
@@ -2902,9 +3089,23 @@ def main() -> int:
             f"cache root is missing or is not a directory: {cache_root}; "
             "refusing to create it because the cache mount may be absent"
         )
-    mkdir_group_safe(cache_root / "reports")
 
     dry_run = bool(cache_cfg.get("dry_run", True)) or args.dry_run
+    maintenance_cfg = config.get("hotcache", {}).get("maintenance", {})
+    restore_all_and_disable = bool(
+        maintenance_cfg.get("restore_all_files_and_disable", False)
+    )
+
+    if cache_cfg.get("enable_promotion", True) and not restore_all_and_disable:
+        visibility_warning = guard_promotion_cache_visibility(
+            config,
+            cache_root,
+            dry_run=dry_run,
+        )
+        if visibility_warning:
+            print(f"WARNING: {visibility_warning}", file=sys.stderr)
+
+    mkdir_group_safe(cache_root / "reports")
 
     max_cache_size = parse_size(cache_cfg.get("max_cache_size", "50GB"))
     min_free_space = parse_size(cache_cfg.get("minimum_free_cache_space", "5GB"))
@@ -2927,9 +3128,6 @@ def main() -> int:
         projected_music_used=manifest_group_size(manifest, "music"),
         projected_video_used=manifest_group_size(manifest, "video"),
     )
-
-    maintenance_cfg = config.get("hotcache", {}).get("maintenance", {})
-    restore_all_and_disable = bool(maintenance_cfg.get("restore_all_files_and_disable", False))
 
     if restore_all_and_disable:
         try:

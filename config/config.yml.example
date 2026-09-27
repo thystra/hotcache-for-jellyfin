@@ -31,6 +31,21 @@ jellyfin:
   api_key: ""
   api_key_env: "JELLYFIN_API_KEY"
 
+  # Hotcache writes absolute symlinks into the media library. Before a real
+  # promotion, verify that the running Jellyfin process sees cache.root at the
+  # same absolute path and that it resolves to the same host directory.
+  #
+  # This works for bare-metal and containerized Jellyfin by inspecting the
+  # running process mount namespace through /proc/PID/root. Containerized
+  # Jellyfin normally needs a same-path read-only bind such as:
+  #   /mnt/cache/jellyfin-cache:/mnt/cache/jellyfin-cache:ro
+  verify_cache_visibility: true
+
+  # Linux process name used for the visibility check. The normal Jellyfin
+  # executable reports "jellyfin". Change this only for a nonstandard wrapper
+  # or executable name.
+  process_name: "jellyfin"
+
 playback_reporting:
   # Playback-history backend. Supported values:
   #

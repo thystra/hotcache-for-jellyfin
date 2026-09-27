@@ -38,8 +38,9 @@ sudo jellyfin-hotcache \
 promote/demote/restore files, and does not save the manifest or write reports.
 It checks Jellyfin `/Sessions`, playback database connectivity/schema, library
 paths, the cache root and free-space limits, run-lock availability, manifest
-entries, cache containment, symlink targets, preserved originals, and orphaned
-cache files.
+entries, cache containment, symlink targets, preserved originals, orphaned
+cache files, and whether the running Jellyfin process can see `cache.root` at
+the same absolute path that Hotcache writes into promoted symlinks.
 
 Exit status:
 
@@ -50,6 +51,54 @@ Exit status:
 Normal mutating runs fail closed if active streams or playback history cannot
 be checked. A missing configured cache root is also fatal; Hotcache will not
 create it because that could hide a missing cache mount.
+
+## Bare metal and container mount safety
+
+Hotcache preserves Jellyfin's original media pathname by replacing a promoted
+media file with an **absolute symlink** whose target is under `cache.root`.
+Jellyfin therefore must be able to see the same cache directory at the same
+absolute path.
+
+By default, `jellyfin.verify_cache_visibility: true` verifies this against the
+actual running Jellyfin process before a real promotion. On Linux, Hotcache
+locates the configured Jellyfin process name (default `jellyfin`) and inspects
+its mount namespace through `/proc/PID/root`. This does not depend on Docker,
+Podman, or another container CLI.
+
+A normal bare-metal Jellyfin process naturally sees the host cache path. For a
+containerized Jellyfin deployment, bind-mount the Hotcache root into the
+container at the **same absolute path**. For example:
+
+```yaml
+services:
+  jellyfin:
+    volumes:
+      - /mnt/nest/videos:/mnt/nest/videos:rw
+      - /mnt/cache/jellyfin-cache:/mnt/cache/jellyfin-cache:ro
+```
+
+Read-only (`:ro`) is sufficient for the Jellyfin-side cache mount: Hotcache
+manages cache contents on the host and Jellyfin only needs to follow and read
+the symlink targets.
+
+After adding or changing a Docker/Compose mount, recreate the Jellyfin
+container; a simple container restart does not add a new bind mount.
+
+`--check` reports `Jellyfin cache visibility` as `FAIL` when the running
+Jellyfin process cannot see `cache.root`, or when the same pathname resolves to
+a different directory in Jellyfin's mount namespace. A real run with promotion
+enabled refuses to promote any new file in that state, before renaming the
+source or creating a symlink. A dry-run remains non-destructive and prints a
+warning instead. Explicit restore-all maintenance remains available so an
+operator can recover already-promoted files even when Jellyfin's cache mount is
+broken.
+
+For unusual deployments where Jellyfin does not run on the Hotcache host,
+`jellyfin.verify_cache_visibility: false` disables this guard and produces a
+warning. That removes an important safety check and should be used only when
+the operator has independently verified that Jellyfin can resolve the absolute
+cache targets. If the local Jellyfin executable uses a nonstandard Linux
+process name, set `jellyfin.process_name` instead of disabling the guard.
 
 ## Cache aging and demotion
 

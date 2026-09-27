@@ -1,3 +1,17 @@
+jellyfin-hotcache (1.0.1-1) unstable; urgency=medium
+
+  * Add stock Jellyfin core SQLite playback-history support.
+  * Load the optional environment file directly for command-line runs.
+  * Use explicit IEC units and expanded cache/category reporting.
+  * Add ZFS dataset, quota, refquota, and available-space reporting.
+  * Add configurable cold-cache demotion with a 14-day default.
+  * Correct projected cache accounting after demotion and restore operations.
+  * Reconcile already-promoted media with manifest and on-disk cache state.
+  * Distinguish current promoted state from promotion actions and candidates.
+  * Add Docker-based PostgreSQL and Jellyfin integration qualification.
+
+ -- Alan Johnson <alan@argentwolf.org>  Sun, 27 Sep 2026 10:15:00 -0400
+
 jellyfin-hotcache (1.0.0-1) unstable; urgency=medium
 
   * First formally packaged release.

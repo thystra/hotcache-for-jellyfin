@@ -1,7 +1,7 @@
 Source: jellyfin-hotcache
 Section: utils
 Priority: optional
-Maintainer: Alan <alan@argentwolf.org>
+Maintainer: Alan Johnson <alan@argentwolf.org>
 Build-Depends:
  debhelper-compat (= 13),
  python3,

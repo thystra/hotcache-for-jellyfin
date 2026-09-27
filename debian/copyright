@@ -11,7 +11,7 @@ Files: .gitignore
  service/*
  tests/*
  debian/*
-Copyright: 2026 Alan <alan@argentwolf.org>
+Copyright: 2026 Alan Johnson <alan@argentwolf.org>
 License: GPL-3+
 
 Files: LICENSE

@@ -3,46 +3,55 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JELLYFIN_IMAGE="${1:-${JELLYFIN_TEST_IMAGE:-jellyfin/jellyfin:12.1}}"
-NAME="hotcache-jellyfin-sqlite-$$"
-WORK="$(mktemp -d)"
-CONFIG_DIR="$WORK/config"
-CACHE_DIR="$WORK/cache"
-MEDIA_DIR="$WORK/media"
-DB_PATH="$CONFIG_DIR/data/jellyfin.db"
+SUFFIX="$(date +%s)-$$-$RANDOM"
+NAME="hotcache-jellyfin-sqlite-$SUFFIX"
+TEST_NAME="hotcache-jellyfin-client-$SUFFIX"
+CONFIG_VOLUME="hotcache-jellyfin-config-$SUFFIX"
+CACHE_VOLUME="hotcache-jellyfin-cache-$SUFFIX"
+MEDIA_VOLUME="hotcache-jellyfin-media-$SUFFIX"
 
 cleanup() {
+    docker rm -f "$TEST_NAME" >/dev/null 2>&1 || true
     docker rm -f "$NAME" >/dev/null 2>&1 || true
-
-    # Jellyfin may create bind-mounted files owned by its container UID.
-    # Remove the contents from a root container before removing the host
-    # temporary directory.
-    if [ -d "$WORK" ]; then
-        docker run --rm             -v "$WORK:/cleanup"             python:3.14-slim             sh -c 'rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?*'             >/dev/null 2>&1 || true
-        rmdir "$WORK" >/dev/null 2>&1 || true
-    fi
+    docker volume rm -f \
+        "$CONFIG_VOLUME" \
+        "$CACHE_VOLUME" \
+        "$MEDIA_VOLUME" \
+        >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$MEDIA_DIR"
-chmod 0755 "$WORK"
-chmod 0777 "$CONFIG_DIR" "$CACHE_DIR" "$MEDIA_DIR"
+docker volume create "$CONFIG_VOLUME" >/dev/null
+docker volume create "$CACHE_VOLUME" >/dev/null
+docker volume create "$MEDIA_VOLUME" >/dev/null
+
+# Named volumes live in the Docker daemon, so they work identically with local
+# Docker and with the Forgejo runners' isolated Docker-in-Docker daemon.
+docker run --rm \
+    -v "$CONFIG_VOLUME:/config" \
+    -v "$CACHE_VOLUME:/cache" \
+    -v "$MEDIA_VOLUME:/media" \
+    python:3.14-slim \
+    sh -ec 'chmod 0777 /config /cache /media'
 
 echo "Initializing Jellyfin SQLite schema with $JELLYFIN_IMAGE"
 docker run -d \
     --name "$NAME" \
-    -v "$CONFIG_DIR:/config" \
-    -v "$CACHE_DIR:/cache" \
-    -v "$MEDIA_DIR:/media" \
+    -v "$CONFIG_VOLUME:/config" \
+    -v "$CACHE_VOLUME:/cache" \
+    -v "$MEDIA_VOLUME:/media" \
     "$JELLYFIN_IMAGE" >/dev/null
 
 ready=0
 for _ in $(seq 1 120); do
-    if [ -s "$DB_PATH" ]; then
+    if docker exec "$NAME" test -s /config/data/jellyfin.db >/dev/null 2>&1 \
+        && docker logs "$NAME" 2>&1 | grep -q 'Startup complete'; then
         ready=1
         break
     fi
+
     if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" != "true" ]; then
-        echo "Jellyfin container exited before creating jellyfin.db" >&2
+        echo "Jellyfin container exited before completing SQLite initialization" >&2
         docker logs "$NAME" >&2 || true
         exit 1
     fi
@@ -50,7 +59,7 @@ for _ in $(seq 1 120); do
 done
 
 if [ "$ready" -ne 1 ]; then
-    echo "Timed out waiting for $DB_PATH" >&2
+    echo "Timed out waiting for Jellyfin SQLite initialization" >&2
     docker logs "$NAME" >&2 || true
     exit 1
 fi
@@ -59,10 +68,14 @@ fi
 # the database read-only.
 docker stop "$NAME" >/dev/null
 
-docker run --rm \
-    -v "$ROOT:/src:ro" \
-    -v "$CONFIG_DIR:/jellyfin-config:ro" \
+docker create \
+    --name "$TEST_NAME" \
+    -v "$CONFIG_VOLUME:/jellyfin-config" \
     -w /src \
     -e HOTCACHE_TEST_JELLYFIN_DB=/jellyfin-config/data/jellyfin.db \
     python:3.14-slim \
-    sh -ec 'pip install --quiet pytest pyyaml && python -m pytest -v -p no:cacheprovider tests/test_jellyfin_sqlite.py'
+    sh -ec 'pip install --quiet pytest pyyaml && python -m pytest -v -p no:cacheprovider tests/test_jellyfin_sqlite.py' \
+    >/dev/null
+
+docker cp "$ROOT/." "$TEST_NAME:/src"
+docker start -a "$TEST_NAME"

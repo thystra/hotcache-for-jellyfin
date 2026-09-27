@@ -1,3 +1,14 @@
+jellyfin-hotcache (1.0.2-1) unstable; urgency=medium
+
+  * Detect whether Jellyfin runs on bare metal or in an isolated container.
+  * Verify the configured cache root is visible to the running Jellyfin process
+    at the same absolute path before promoting media.
+  * Refuse real promotions when a container cannot access Hotcache targets.
+  * Add Docker/Compose cache-bind guidance and consumer-visibility preflight.
+  * Add regression coverage for bare-metal and containerized Jellyfin installs.
+
+ -- Alan Johnson <alan@argentwolf.org>  Sun, 27 Sep 2026 15:45:01 -0400
+
 jellyfin-hotcache (1.0.1-1) unstable; urgency=medium
 
   * Add stock Jellyfin core SQLite playback-history support.

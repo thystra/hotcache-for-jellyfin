@@ -53,6 +53,7 @@ def test_report_shows_group_usage_and_remaining(hotcache, base_config):
     config["cache"]["max_cache_size"] = "190GiB"
     config["cache"]["music"]["max_cache_size"] = "5GiB"
     config["cache"]["music"]["reserve_for_music"] = "5GiB"
+    config["cache"]["minimum_free_cache_space"] = "5GiB"
 
     report = hotcache.RunReport(
         started_at="2026-09-26T20:53:40-04:00",
@@ -68,13 +69,15 @@ def test_report_shows_group_usage_and_remaining(hotcache, base_config):
 
     text = hotcache.build_report_text(config, report)
 
-    assert "Configured limit:   190.0 GiB" in text
-    assert "Projected used:     100.0 GiB" in text
-    assert "Remaining allowed:  90.0 GiB" in text
-    assert "Music limit:        5.0 GiB" in text
-    assert "Music projected:    3.0 GiB" in text
-    assert "Music remaining:    2.0 GiB" in text
-    assert "Video limit:        185.0 GiB" in text
-    assert "Video projected:    97.0 GiB" in text
-    assert "Video remaining:    88.0 GiB" in text
-    assert "Filesystem free:    134.0 GiB" in text
+    assert "Configured limit:     190.0 GiB" in text
+    assert "Projected used:       100.0 GiB" in text
+    assert "Remaining by policy:  90.0 GiB" in text
+    assert "Music limit:          5.0 GiB" in text
+    assert "Music projected:      3.0 GiB" in text
+    assert "Music remaining:      2.0 GiB" in text
+    assert "Video limit:          185.0 GiB" in text
+    assert "Video projected:      97.0 GiB" in text
+    assert "Video remaining:      88.0 GiB" in text
+    assert "Filesystem available: 134.0 GiB" in text
+    assert "Projected growth:     30.0 GiB" in text
+    assert "Effective remaining:  90.0 GiB" in text

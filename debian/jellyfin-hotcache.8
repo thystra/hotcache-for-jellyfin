@@ -38,13 +38,41 @@ Jellyfin API access, playback database connectivity and schema, configured
 libraries, cache limits and free space, lock availability, manifest entries,
 cache containment, symlink targets, preserved originals, and orphan cache
 files. It does not promote, demote, or restore files and does not create the
-cache root, lock file, report, or manifest.
+cache root, lock file, report, or manifest. Filesystem capacity checks
+include ZFS dataset quota/refquota information when available.
 .TP
 .B \-\-dry-run
 Force dry-run behavior regardless of the configuration setting.
 .TP
 .B \-\-no-email
 Do not send the run report by email.
+.SH CACHE AGING
+The
+.B cache.hot_window_days
+setting determines how recently an item must have been played to continue
+qualifying as hot. If
+.B cache.enable_demotion
+is true,
+.B cache.demote_after_days_cold
+sets the additional grace period after the item stops qualifying as hot. The
+shipped example uses 14 days.
+.PP
+The older
+.B cache.demote_after_days_unwatched
+name remains accepted as a compatibility alias. If both names are present,
+.B cache.demote_after_days_cold
+takes precedence.
+.SH FILESYSTEM CAPACITY
+Run reports inspect the filesystem containing the cache root. On ZFS, the
+report includes the dataset, pool, quota, refquota, used, referenced, available,
+and pool free values when the corresponding tools are available.
+.PP
+The ZFS dataset
+.B available
+value is used for writable-space reporting. Pool free space is informational.
+The report's effective remaining capacity is the smaller of the Hotcache policy
+headroom and filesystem headroom after the configured minimum free-space
+reserve. Dry-run projected growth is included in that calculation.
 .SH FILES
 .TP
 .I /etc/jellyfin-hotcache/config.yml
@@ -84,4 +112,7 @@ Site-specific mount dependencies should be added with a local systemd drop-in.
 .SH SEE ALSO
 .BR systemctl (1),
 .BR systemd.service (5),
-.BR systemd.timer (5)
+.BR systemd.timer (5),
+.BR findmnt (8),
+.BR zfs (8),
+.BR zpool (8)

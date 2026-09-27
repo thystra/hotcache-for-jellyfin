@@ -97,8 +97,10 @@ cache:
 
   enable_promotion: true
 
-  # Keep demotion disabled until the manifest and symlink behavior are trusted.
-  enable_demotion: false
+  # Age cold items out of the hot cache automatically. The shipped example
+  # remains dry-run by default, so review the proposed demotions before enabling
+  # real mutations.
+  enable_demotion: true
 
   # File-level caching only.
   promotion_mode: "main_file_only"
@@ -133,7 +135,14 @@ cache:
     max_cache_size: "5GB"
     reserve_for_music: "5GB"
 
-  demote_after_days_unwatched: 90
+  # Grace period after a cached item stops qualifying as hot. With the
+  # default hot_window_days: 30 and this value: 14, an item normally remains
+  # cached for no more than about 44 days after its last playback.
+  demote_after_days_cold: 14
+
+  # Compatibility alias for older configurations. If both are present,
+  # demote_after_days_cold wins.
+  # demote_after_days_unwatched: 14
 
   verify_copy: true
   use_absolute_symlinks: true

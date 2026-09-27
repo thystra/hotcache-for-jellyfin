@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fast-tests:
+    runs-on: forgejo-workstation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Docker client
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-cli ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Verify isolated Docker transport
+        run: |
+          set -euo pipefail
+          test -n "${DOCKER_HOST:-}"
+          test ! -S /var/run/docker.sock
+          case "$DOCKER_HOST" in
+            tcp://*) ;;
+            *)
+              echo "Forgejo CI requires the isolated TCP Docker endpoint" >&2
+              exit 1
+              ;;
+          esac
+          docker version
+          docker info >/dev/null
+
+      - name: Run fast tests in Python container
+        run: ./tests/run-fast-tests-docker.sh
+
+  postgresql-18:
+    runs-on: forgejo-workstation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Docker client
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-cli ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Verify isolated Docker transport
+        run: |
+          set -euo pipefail
+          test -n "${DOCKER_HOST:-}"
+          test ! -S /var/run/docker.sock
+          case "$DOCKER_HOST" in
+            tcp://*) ;;
+            *)
+              echo "Forgejo CI requires the isolated TCP Docker endpoint" >&2
+              exit 1
+              ;;
+          esac
+          docker version
+          docker info >/dev/null
+
+      - name: Run PostgreSQL integration test
+        run: ./tests/run-postgresql-integration.sh
+
+  jellyfin-sqlite:
+    runs-on: forgejo-workstation
+    strategy:
+      matrix:
+        jellyfin_image:
+          - jellyfin/jellyfin:10.11.11
+          - jellyfin/jellyfin:12.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Docker client
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends docker-cli ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Verify isolated Docker transport
+        run: |
+          set -euo pipefail
+          test -n "${DOCKER_HOST:-}"
+          test ! -S /var/run/docker.sock
+          case "$DOCKER_HOST" in
+            tcp://*) ;;
+            *)
+              echo "Forgejo CI requires the isolated TCP Docker endpoint" >&2
+              exit 1
+              ;;
+          esac
+          docker version
+          docker info >/dev/null
+
+      - name: Probe official Jellyfin SQLite schema and run synthetic tests
+        run: ./tests/run-jellyfin-sqlite-integration.sh "${{ matrix.jellyfin_image }}"

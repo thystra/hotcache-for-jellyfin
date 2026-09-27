@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fast-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run fast tests in Python container
+        run: ./tests/run-fast-tests-docker.sh
+
+  postgresql-18:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run PostgreSQL integration test
+        run: ./tests/run-postgresql-integration.sh
+
+  jellyfin-sqlite:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        jellyfin_image:
+          - jellyfin/jellyfin:10.11.11
+          - jellyfin/jellyfin:12.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Probe official Jellyfin SQLite schema and run synthetic tests
+        run: ./tests/run-jellyfin-sqlite-integration.sh "${{ matrix.jellyfin_image }}"

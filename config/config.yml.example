@@ -32,21 +32,39 @@ jellyfin:
   api_key_env: "JELLYFIN_API_KEY"
 
 playback_reporting:
-  # Supported values:
-  #   sqlite      - read the older local Playback Reporting SQLite DB
-  #   postgresql  - read Jellyfin core PostgreSQL UserData history first;
-  #                 falls back only to real Playback Reporting event tables
+  # Playback-history backend. Supported values:
   #
-  # In PostgreSQL mode, the script prefers public.UserData joined to
-  # public.BaseItems, not ActivityLogs. UserData supplies lifetime PlayCount
-  # and LastPlayedDate; therefore hot_window_days means "last played within
-  # window", not "all plays occurred within window". Paths are resolved from
-  # PostgreSQL BaseItems to avoid /Items API failures seen on some migrated
-  # PostgreSQL installs: "Cannot deserialize unknown type."
-  source: "postgresql"
+  #   jellyfin_sqlite
+  #       Stock/default Jellyfin SQLite. Reads core UserData for lifetime
+  #       PlayCount + LastPlayedDate and BaseItems for media paths. This does
+  #       not require the Playback Reporting plugin.
+  #
+  #   postgresql
+  #       Jellyfin core PostgreSQL. Reads public.UserData and public.BaseItems
+  #       first; falls back only to real Playback Reporting event tables.
+  #
+  #   playback_reporting_sqlite
+  #       Legacy Playback Reporting plugin SQLite database. Counts playback
+  #       event rows inside the hot window rather than lifetime PlayCount.
+  #
+  #   sqlite
+  #       Backward-compatible alias for playback_reporting_sqlite.
+  #
+  # Core Jellyfin SQLite/PostgreSQL modes use lifetime PlayCount and require
+  # LastPlayedDate to be within hot_window_days. Duplicate CustomDataKey rows
+  # for one item/user are collapsed before household play counts are summed.
+  #
+  # PostgreSQL path resolution comes from BaseItems instead of /Items because
+  # some migrated PostgreSQL installs can return "Cannot deserialize unknown
+  # type" for those API calls.
+  source: "jellyfin_sqlite"
 
-  # SQLite fallback/legacy location. Ignored when source is postgresql.
-  database_path: "/var/lib/jellyfin/data/playback_reporting.db"
+  # Used by SQLite modes. Stock Jellyfin core SQLite normally lives here:
+  database_path: "/var/lib/jellyfin/data/jellyfin.db"
+
+  # For source: playback_reporting_sqlite (or legacy source: sqlite), use the
+  # Playback Reporting plugin database instead:
+  # database_path: "/var/lib/jellyfin/data/playback_reporting.db"
 
   postgresql:
     # Option A: DSN. If dsn is set, it is used instead of host/port/database.
@@ -58,7 +76,8 @@ playback_reporting:
     database: "jellyfin_pg"
     user: "jellyfin_pg"
 
-    # Prefer a .pgpass file or password_env instead of storing a password here.
+    # Used only when source is postgresql. Prefer a .pgpass file or
+    # password_env instead of storing a password here.
     # password: ""
     # password_env: "JELLYFIN_PG_PASSWORD"
     sslmode: "disable"

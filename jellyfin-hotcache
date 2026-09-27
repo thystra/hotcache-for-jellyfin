@@ -102,6 +102,8 @@ class RunReport:
     cache_limit: int = 0
     filesystem_free: int = 0
     projected_cache_used: int = 0
+    projected_music_used: int = 0
+    projected_video_used: int = 0
 
 
 @dataclass
@@ -151,14 +153,65 @@ def parse_size(value: str | int | float) -> int:
 
 
 def human_size(num: int) -> str:
+    """Format a byte count using explicit IEC binary units."""
     n = float(num)
-    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
-        if n < 1000 or unit == "PB":
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
+        if abs(n) < 1024 or unit == "PiB":
             if unit == "B":
                 return f"{int(n)} B"
             return f"{n:.1f} {unit}"
-        n /= 1000
+        n /= 1024
     return f"{num} B"
+
+
+def load_environment_file(path: Path) -> int:
+    """
+    Load simple NAME=value entries without overriding the process environment.
+
+    The parser intentionally does not execute shell syntax or perform variable
+    expansion. Blank lines and lines beginning with '#' or ';' are ignored,
+    and a complete value may be wrapped in matching single or double quotes.
+    """
+    if not path.exists():
+        return 0
+    if not path.is_file():
+        raise RuntimeError(f"Environment file is not a regular file: {path}")
+
+    loaded = 0
+    with path.open("r", encoding="utf-8") as fh:
+        for line_number, raw_line in enumerate(fh, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            if "=" not in line:
+                raise RuntimeError(
+                    f"Invalid environment file line {line_number} in {path}: expected NAME=value"
+                )
+
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+
+            if not name or not (name[0].isalpha() or name[0] == "_") or not all(
+                char.isalnum() or char == "_" for char in name
+            ):
+                raise RuntimeError(
+                    f"Invalid environment variable name on line {line_number} in {path}: {name!r}"
+                )
+
+            if value[:1] in {"'", '"'}:
+                quote = value[0]
+                if len(value) < 2 or value[-1] != quote:
+                    raise RuntimeError(
+                        f"Unterminated quoted value on line {line_number} in {path}"
+                    )
+                value = value[1:-1]
+
+            if name not in os.environ:
+                os.environ[name] = value
+                loaded += 1
+
+    return loaded
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -490,7 +543,9 @@ def query_playback_reporting_sqlite(
     extensions: set[str],
 ) -> list[Candidate]:
     playback = config.get("playback_reporting", {})
-    db_path = Path(playback.get("database_path", ""))
+    db_path = Path(
+        playback.get("database_path", "/var/lib/jellyfin/data/playback_reporting.db")
+    )
     if not db_path.exists():
         raise RuntimeError(f"Playback Reporting database not found: {db_path}")
 
@@ -630,6 +685,212 @@ def query_playback_reporting_sqlite(
                 last_played=str(row["last_played"]),
                 size_bytes=size,
                 reason=f"{plays} plays in last {hot_window_days} days",
+            )
+        )
+
+    return candidates
+
+
+def _quote_sqlite_ident(identifier: str) -> str:
+    """Quote a SQLite identifier."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def inspect_jellyfin_sqlite_schema(db_path: Path) -> dict[str, Any]:
+    """
+    Inspect a core Jellyfin SQLite database without modifying it.
+
+    Jellyfin's core SQLite and PostgreSQL backends expose the same logical
+    playback state through UserData and media paths through BaseItems. Keep
+    this inspection strict so schema drift fails closed instead of silently
+    producing an incomplete candidate set.
+    """
+    if not db_path.exists():
+        raise RuntimeError(f"Jellyfin SQLite database not found: {db_path}")
+
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        tables = {
+            str(row["name"]).lower(): str(row["name"])
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        }
+
+        userdata_table = tables.get("userdata")
+        baseitems_table = tables.get("baseitems")
+        if not userdata_table or not baseitems_table:
+            raise RuntimeError(
+                "Jellyfin core SQLite schema requires UserData and BaseItems; "
+                f"found tables: {sorted(tables.values())}"
+            )
+
+        def column_map(table_name: str) -> dict[str, str]:
+            return {
+                str(row["name"]).lower(): str(row["name"])
+                for row in con.execute(
+                    f"PRAGMA table_info({_quote_sqlite_ident(table_name)})"
+                )
+            }
+
+        userdata_columns = column_map(userdata_table)
+        baseitems_columns = column_map(baseitems_table)
+
+        required_userdata = {"itemid", "userid", "playcount", "lastplayeddate"}
+        required_baseitems = {"id", "path"}
+        missing_userdata = sorted(required_userdata - set(userdata_columns))
+        missing_baseitems = sorted(required_baseitems - set(baseitems_columns))
+
+        if missing_userdata:
+            raise RuntimeError(
+                "Jellyfin SQLite UserData is missing columns: "
+                + ", ".join(missing_userdata)
+            )
+        if missing_baseitems:
+            raise RuntimeError(
+                "Jellyfin SQLite BaseItems is missing columns: "
+                + ", ".join(missing_baseitems)
+            )
+
+        return {
+            "userdata_table": userdata_table,
+            "baseitems_table": baseitems_table,
+            "userdata_columns": userdata_columns,
+            "baseitems_columns": baseitems_columns,
+        }
+    finally:
+        con.close()
+
+
+def query_jellyfin_sqlite(
+    config: dict[str, Any],
+    libraries: list[Library],
+    extensions: set[str],
+) -> list[Candidate]:
+    """
+    Read playback state from Jellyfin's core SQLite database.
+
+    This mirrors the PostgreSQL UserData behavior: PlayCount is lifetime state,
+    while LastPlayedDate must be inside the configured hot window. Duplicate
+    CustomDataKey rows are collapsed to one state per item/user before play
+    counts are summed across users.
+    """
+    playback = config.get("playback_reporting", {})
+    db_path = Path(
+        playback.get("database_path", "/var/lib/jellyfin/data/jellyfin.db")
+    )
+    schema = inspect_jellyfin_sqlite_schema(db_path)
+
+    userdata_table = str(schema["userdata_table"])
+    baseitems_table = str(schema["baseitems_table"])
+    userdata_columns = dict(schema["userdata_columns"])
+    baseitems_columns = dict(schema["baseitems_columns"])
+
+    item_col = userdata_columns["itemid"]
+    user_col = userdata_columns["userid"]
+    play_count_col = userdata_columns["playcount"]
+    last_played_col = userdata_columns["lastplayeddate"]
+    base_id_col = baseitems_columns["id"]
+    base_path_col = baseitems_columns["path"]
+    base_name_col = baseitems_columns.get("name")
+
+    q_userdata = _quote_sqlite_ident(userdata_table)
+    q_baseitems = _quote_sqlite_ident(baseitems_table)
+    q_item = _quote_sqlite_ident(item_col)
+    q_user = _quote_sqlite_ident(user_col)
+    q_play_count = _quote_sqlite_ident(play_count_col)
+    q_last_played = _quote_sqlite_ident(last_played_col)
+    q_base_id = _quote_sqlite_ident(base_id_col)
+    q_base_path = _quote_sqlite_ident(base_path_col)
+    q_base_name = _quote_sqlite_ident(base_name_col) if base_name_col else None
+
+    hot_window_days = int(config["cache"].get("hot_window_days", 30))
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=hot_window_days)
+    cutoff_min = cutoff.strftime("%Y-%m-%d")
+    title_expr = f"MIN(CAST(bi.{q_base_name} AS TEXT))" if q_base_name else "MIN(pu.item_id)"
+
+    sql = f"""
+        WITH per_user AS (
+            SELECT CAST(ud.{q_item} AS TEXT) AS item_id,
+                   CAST(ud.{q_user} AS TEXT) AS user_id,
+                   MAX(COALESCE(ud.{q_play_count}, 0)) AS plays,
+                   MAX(ud.{q_last_played}) AS last_played
+            FROM {q_userdata} ud
+            WHERE ud.{q_last_played} >= ?
+              AND COALESCE(ud.{q_play_count}, 0) > 0
+            GROUP BY ud.{q_item}, ud.{q_user}
+        )
+        SELECT pu.item_id,
+               MIN(pu.user_id) AS user_id,
+               {title_expr} AS title,
+               COALESCE(SUM(pu.plays), 0) AS plays,
+               MAX(pu.last_played) AS last_played,
+               MIN(CAST(bi.{q_base_path} AS TEXT)) AS path
+        FROM per_user pu
+        JOIN {q_baseitems} bi
+          ON pu.item_id = CAST(bi.{q_base_id} AS TEXT)
+        WHERE bi.{q_base_path} IS NOT NULL
+          AND CAST(bi.{q_base_path} AS TEXT) <> ''
+        GROUP BY pu.item_id
+        HAVING COALESCE(SUM(pu.plays), 0) > 0
+        ORDER BY plays DESC, last_played DESC
+    """
+
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = list(con.execute(sql, (cutoff_min,)))
+    finally:
+        con.close()
+
+    candidates: list[Candidate] = []
+    ignore_dirs = set(config.get("media_selection", {}).get("ignore_dirs", []))
+
+    for row in rows:
+        item_id = str(row["item_id"])
+        user_id = str(row["user_id"] or "")
+        title = str(row["title"] or item_id)
+        path = str(row["path"] or "")
+        if not path:
+            continue
+
+        source_file = Path(path)
+        if source_file.is_dir():
+            source_file = find_largest_video_file(source_file, ignore_dirs, extensions)
+            if source_file is None:
+                continue
+
+        if not is_video_file(source_file, extensions):
+            continue
+
+        library = find_matching_library(source_file, libraries)
+        if not library:
+            continue
+
+        plays = int(row["plays"])
+        if plays < library.promote_after_plays:
+            continue
+
+        try:
+            size = source_file.stat().st_size
+        except FileNotFoundError:
+            continue
+
+        if title == item_id:
+            title = source_file.stem
+
+        candidates.append(
+            Candidate(
+                item_id=item_id,
+                user_id=user_id,
+                title=title,
+                source_file=source_file,
+                library=library,
+                plays=plays,
+                last_played=str(row["last_played"]),
+                size_bytes=size,
+                reason=f"{plays} lifetime plays; last played within {hot_window_days} days",
             )
         )
 
@@ -1578,20 +1839,27 @@ def format_action(action: Action) -> str:
 
 def build_report_text(config: dict[str, Any], report: RunReport) -> str:
     cache_root = config["cache"]["root"]
+    projected_total = report.projected_cache_used or report.cache_used_after
+    music_limit = get_music_cache_limit(config)
+    video_limit = get_video_effective_limit(config, report.cache_limit)
     lines = [
         f"Jellyfin Hot Cache Report - {report.started_at}",
         "",
         "Cache status:",
-        f"  Cache path:        {cache_root}",
-        f"  Configured limit:  {human_size(report.cache_limit)}",
-        f"  Used before:       {human_size(report.cache_used_before)}",
-        f"  Used after:        {human_size(report.cache_used_after)}",
-        f"  Projected used:    {human_size(report.projected_cache_used or report.cache_used_after)}",
-        f"  Remaining allowed: {human_size(max(report.cache_limit - (report.projected_cache_used or report.cache_used_after), 0))}",
-        f"  Music limit:       {human_size(get_music_cache_limit(config))}",
-        f"  Video limit:       {human_size(get_video_effective_limit(config, report.cache_limit))}",
-        f"  Filesystem free:   {human_size(report.filesystem_free)}",
-        f"  Dry run:           {report.dry_run}",
+        f"  Cache path:         {cache_root}",
+        f"  Configured limit:   {human_size(report.cache_limit)}",
+        f"  Used before:        {human_size(report.cache_used_before)}",
+        f"  Used after:         {human_size(report.cache_used_after)}",
+        f"  Projected used:     {human_size(projected_total)}",
+        f"  Remaining allowed:  {human_size(max(report.cache_limit - projected_total, 0))}",
+        f"  Music limit:        {human_size(music_limit)}",
+        f"  Music projected:    {human_size(report.projected_music_used)}",
+        f"  Music remaining:    {human_size(max(music_limit - report.projected_music_used, 0))}",
+        f"  Video limit:        {human_size(video_limit)}",
+        f"  Video projected:    {human_size(report.projected_video_used)}",
+        f"  Video remaining:    {human_size(max(video_limit - report.projected_video_used, 0))}",
+        f"  Filesystem free:    {human_size(report.filesystem_free)}",
+        f"  Dry run:            {report.dry_run}",
         "",
     ]
 
@@ -1777,7 +2045,12 @@ def _check_postgresql_readonly(config: dict[str, Any], results: list[CheckResult
 
 def _check_sqlite_readonly(config: dict[str, Any], results: list[CheckResult]) -> None:
     playback = config.get("playback_reporting", {}) or {}
-    db_path = Path(playback.get("database_path", ""))
+    db_path = Path(
+        playback.get(
+            "database_path",
+            "/var/lib/jellyfin/data/playback_reporting.db",
+        )
+    )
     if not db_path.exists():
         _check_result(results, "FAIL", "SQLite playback database", f"not found: {db_path}")
         return
@@ -1790,6 +2063,29 @@ def _check_sqlite_readonly(config: dict[str, Any], results: list[CheckResult]) -
         _check_result(results, "PASS", "SQLite playback database", f"readable; {len(rows)} tables")
     except Exception as exc:
         _check_result(results, "FAIL", "SQLite playback database", str(exc))
+
+
+def _check_jellyfin_sqlite_readonly(
+    config: dict[str, Any],
+    results: list[CheckResult],
+) -> None:
+    playback = config.get("playback_reporting", {}) or {}
+    db_path = Path(
+        playback.get("database_path", "/var/lib/jellyfin/data/jellyfin.db")
+    )
+    try:
+        schema = inspect_jellyfin_sqlite_schema(db_path)
+        _check_result(
+            results,
+            "PASS",
+            "Jellyfin SQLite schema",
+            (
+                f"compatible: {schema['userdata_table']} + "
+                f"{schema['baseitems_table']} in {db_path}"
+            ),
+        )
+    except Exception as exc:
+        _check_result(results, "FAIL", "Jellyfin SQLite schema", str(exc))
 
 
 def _symlink_target(path: Path) -> Path:
@@ -1811,17 +2107,24 @@ def run_preflight(config: dict[str, Any]) -> int:
     try:
         key = get_jellyfin_api_key(config)
         _check_result(results, "PASS", "Jellyfin API key", f"configured ({len(key)} characters)")
-        active_paths = get_active_paths(config)
-        _check_result(results, "PASS", "Jellyfin /Sessions", f"accessible; {len(active_paths)} active media paths")
     except Exception as exc:
-        _check_result(results, "FAIL", "Jellyfin /Sessions", str(exc))
+        _check_result(results, "FAIL", "Jellyfin API key", str(exc))
+    else:
+        try:
+            active_paths = get_active_paths(config)
+            _check_result(results, "PASS", "Jellyfin /Sessions", f"accessible; {len(active_paths)} active media paths")
+        except Exception as exc:
+            _check_result(results, "FAIL", "Jellyfin /Sessions", str(exc))
 
     source_mode = str(config.get("playback_reporting", {}).get("source", "sqlite")).lower()
     if source_mode in {"postgresql", "postgres", "pg"}:
         _check_result(results, "PASS", "playback source", "PostgreSQL")
         _check_postgresql_readonly(config, results)
-    elif source_mode == "sqlite":
-        _check_result(results, "PASS", "playback source", "SQLite")
+    elif source_mode in {"jellyfin_sqlite", "core_sqlite", "jellyfin-core-sqlite"}:
+        _check_result(results, "PASS", "playback source", "Jellyfin core SQLite")
+        _check_jellyfin_sqlite_readonly(config, results)
+    elif source_mode in {"sqlite", "playback_reporting_sqlite", "playback-reporting-sqlite"}:
+        _check_result(results, "PASS", "playback source", "Playback Reporting SQLite")
         _check_sqlite_readonly(config, results)
     else:
         _check_result(results, "FAIL", "playback source", f"unsupported source: {source_mode}")
@@ -2019,6 +2322,14 @@ def main() -> int:
         help="Path to YAML config file",
     )
     parser.add_argument(
+        "--environment-file",
+        default="/etc/jellyfin-hotcache/environment",
+        help=(
+            "Path to optional NAME=value environment file; existing process "
+            "environment variables take precedence"
+        ),
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Run read-only preflight checks and exit",
@@ -2036,7 +2347,9 @@ def main() -> int:
     args = parser.parse_args()
 
     config_path = Path(args.config)
+    environment_path = Path(args.environment_file)
     try:
+        load_environment_file(environment_path)
         config = load_config(config_path)
         validate_config(config)
     except Exception as exc:
@@ -2076,13 +2389,16 @@ def main() -> int:
     manifest_path = cache_root / "manifest.json"
     manifest = load_manifest(manifest_path)
 
+    initial_cache_used = directory_size(cache_root)
     report = RunReport(
         started_at=started_at,
         dry_run=dry_run,
-        cache_used_before=directory_size(cache_root),
+        cache_used_before=initial_cache_used,
         cache_limit=max_cache_size,
         filesystem_free=shutil.disk_usage(cache_root).free,
-        projected_cache_used=directory_size(cache_root),
+        projected_cache_used=initial_cache_used,
+        projected_music_used=manifest_group_size(manifest, "music"),
+        projected_video_used=manifest_group_size(manifest, "video"),
     )
 
     maintenance_cfg = config.get("hotcache", {}).get("maintenance", {})
@@ -2133,8 +2449,10 @@ def main() -> int:
         if cache_cfg.get("enable_promotion", True):
             source_mode = config.get("playback_reporting", {}).get("source", "sqlite")
             try:
-                if source_mode == "sqlite":
+                if source_mode in {"sqlite", "playback_reporting_sqlite", "playback-reporting-sqlite"}:
                     candidates = query_playback_reporting_sqlite(config, libraries, extensions)
+                elif source_mode in {"jellyfin_sqlite", "core_sqlite", "jellyfin-core-sqlite"}:
+                    candidates = query_jellyfin_sqlite(config, libraries, extensions)
                 elif source_mode in {"postgresql", "postgres", "pg"}:
                     candidates = query_playback_reporting_postgresql(config, libraries, extensions)
                 else:
@@ -2152,9 +2470,9 @@ def main() -> int:
                 entry["last_seen_hot"] = now_iso()
                 entry["last_played"] = hot_sources[source_str].last_played
 
-        projected_cache_used = directory_size(cache_root)
-        projected_music_used = manifest_group_size(manifest, "music")
-        projected_video_used = manifest_group_size(manifest, "video")
+        projected_cache_used = report.projected_cache_used
+        projected_music_used = report.projected_music_used
+        projected_video_used = report.projected_video_used
 
         for candidate in candidates:
             cache_file = build_cache_path(cache_root, candidate)
@@ -2222,8 +2540,10 @@ def main() -> int:
                 projected_cache_used += candidate.size_bytes
                 if media_group_for_library(candidate.library) == "music":
                     projected_music_used += candidate.size_bytes
+                    report.projected_music_used = projected_music_used
                 else:
                     projected_video_used += candidate.size_bytes
+                    report.projected_video_used = projected_video_used
                 report.projected_cache_used = projected_cache_used
             except Exception as exc:
                 report.errors.append(f"Promotion failed for {candidate.source_file}: {exc}")

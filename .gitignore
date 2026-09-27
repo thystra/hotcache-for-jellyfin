@@ -20,3 +20,16 @@ dist/
 *~
 *.swp
 .DS_Store
+
+# Debian/debhelper generated build state
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.debhelper
+/debian/*.debhelper.log
+/debian/*.substvars
+/debian/jellyfin-hotcache/
+/debian/tmp/
+
+# devscripts temporary changelog backup
+/debian/changelog.dch

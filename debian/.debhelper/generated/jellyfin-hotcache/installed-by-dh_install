@@ -1,4 +1,0 @@
-./jellyfin-hotcache
-./config/config.yml.example
-./service/jellyfin-hotcache.service
-./service/jellyfin-hotcache.timer

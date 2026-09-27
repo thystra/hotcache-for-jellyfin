@@ -88,6 +88,24 @@ class Action:
 
 
 @dataclass
+class FilesystemInfo:
+    fs_type: str = "unknown"
+    source: str = ""
+    mountpoint: str = ""
+    available: int = 0
+    dataset: str = ""
+    pool: str = ""
+    zfs_details_available: bool = False
+    zfs_quota: Optional[int] = None
+    zfs_refquota: Optional[int] = None
+    zfs_used: Optional[int] = None
+    zfs_referenced: Optional[int] = None
+    zfs_available: Optional[int] = None
+    zpool_free: Optional[int] = None
+    warning: str = ""
+
+
+@dataclass
 class RunReport:
     started_at: str
     dry_run: bool
@@ -101,9 +119,13 @@ class RunReport:
     cache_used_after: int = 0
     cache_limit: int = 0
     filesystem_free: int = 0
+    filesystem_info: Optional[FilesystemInfo] = None
     projected_cache_used: int = 0
     projected_music_used: int = 0
     projected_video_used: int = 0
+    promoted_state_count: int = 0
+    promoted_state_bytes: int = 0
+    hot_already_promoted_count: int = 0
 
 
 @dataclass
@@ -162,6 +184,171 @@ def human_size(num: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{num} B"
+
+
+def _run_capture(command: list[str]) -> tuple[Optional[subprocess.CompletedProcess], str]:
+    """Run a short read-only system command and return a soft-failure detail."""
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return None, f"{command[0]} is not installed"
+    except subprocess.TimeoutExpired:
+        return None, f"{command[0]} timed out"
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        return proc, detail
+    return proc, ""
+
+
+def _zfs_numeric(value: str) -> Optional[int]:
+    value = value.strip()
+    if not value or value.lower() in {"none", "-"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def inspect_filesystem(path: Path) -> FilesystemInfo:
+    """
+    Inspect the filesystem containing *path* without changing it.
+
+    Generic filesystems use shutil.disk_usage(). On Linux ZFS, findmnt
+    identifies the dataset and parseable zfs/zpool properties add quota-aware
+    reporting. ZFS "available" is preferred because it already accounts for
+    pool pressure, quotas, reservations, and other dataset limits.
+    """
+    usage = shutil.disk_usage(path)
+    info = FilesystemInfo(
+        available=usage.free,
+        mountpoint=str(path),
+    )
+
+    findmnt, findmnt_error = _run_capture(
+        ["findmnt", "-T", str(path), "-n", "-o", "FSTYPE,SOURCE,TARGET"]
+    )
+    if findmnt is None or findmnt.returncode != 0:
+        info.warning = findmnt_error
+        return info
+
+    fields = findmnt.stdout.strip().split(None, 2)
+    if fields:
+        info.fs_type = fields[0]
+    if len(fields) > 1:
+        info.source = fields[1]
+    if len(fields) > 2:
+        info.mountpoint = fields[2]
+
+    if info.fs_type.lower() != "zfs":
+        return info
+
+    info.dataset = info.source
+    info.pool = info.dataset.split("/", 1)[0] if info.dataset else ""
+
+    zfs_get, zfs_error = _run_capture(
+        [
+            "zfs",
+            "get",
+            "-Hp",
+            "-o",
+            "property,value",
+            "quota,refquota,used,referenced,available",
+            info.dataset,
+        ]
+    )
+    if zfs_get is None or zfs_get.returncode != 0:
+        info.warning = zfs_error
+        return info
+
+    properties: dict[str, str] = {}
+    for raw_line in zfs_get.stdout.splitlines():
+        parts = raw_line.split("\t", 1)
+        if len(parts) == 2:
+            properties[parts[0].strip().lower()] = parts[1].strip()
+
+    required = {"quota", "refquota", "used", "referenced", "available"}
+    missing = sorted(required - set(properties))
+    if missing:
+        info.warning = "zfs get omitted properties: " + ", ".join(missing)
+        return info
+
+    info.zfs_quota = _zfs_numeric(properties["quota"])
+    info.zfs_refquota = _zfs_numeric(properties["refquota"])
+    info.zfs_used = _zfs_numeric(properties["used"])
+    info.zfs_referenced = _zfs_numeric(properties["referenced"])
+    info.zfs_available = _zfs_numeric(properties["available"])
+
+    if info.zfs_used is None or info.zfs_referenced is None or info.zfs_available is None:
+        info.warning = "zfs get returned non-numeric used/referenced/available values"
+        return info
+
+    info.available = info.zfs_available
+    info.zfs_details_available = True
+
+    if info.pool:
+        zpool_get, zpool_error = _run_capture(
+            ["zpool", "get", "-Hp", "-o", "value", "free", info.pool]
+        )
+        if zpool_get is not None and zpool_get.returncode == 0:
+            info.zpool_free = _zfs_numeric(zpool_get.stdout.strip())
+        elif zpool_error:
+            info.warning = zpool_error
+
+    return info
+
+
+def refresh_report_filesystem(report: RunReport, cache_root: Path) -> None:
+    info = inspect_filesystem(cache_root)
+    report.filesystem_info = info
+    report.filesystem_free = info.available
+
+
+def _format_optional_bytes(value: Optional[int], none_text: str = "none") -> str:
+    return none_text if value is None else human_size(value)
+
+
+def calculate_capacity_remaining(
+    config: dict[str, Any],
+    report: RunReport,
+) -> tuple[int, int, int, int, int]:
+    """
+    Return policy remaining, filesystem available, reserve, projected growth,
+    and effective remaining.
+
+    For dry-runs, projected promotions have not consumed filesystem space yet,
+    so subtract that projected growth before reporting additional headroom.
+    """
+    projected_total = report.projected_cache_used or report.cache_used_after
+    policy_remaining = max(report.cache_limit - projected_total, 0)
+    filesystem_available = (
+        report.filesystem_info.available
+        if report.filesystem_info is not None
+        else report.filesystem_free
+    )
+    minimum_free = parse_size(
+        config.get("cache", {}).get("minimum_free_cache_space", "0B")
+    )
+    projected_growth = max(projected_total - report.cache_used_after, 0)
+    filesystem_headroom = max(
+        filesystem_available - minimum_free - projected_growth,
+        0,
+    )
+    effective_remaining = min(policy_remaining, filesystem_headroom)
+    return (
+        policy_remaining,
+        filesystem_available,
+        minimum_free,
+        projected_growth,
+        effective_remaining,
+    )
 
 
 def load_environment_file(path: Path) -> int:
@@ -281,6 +468,64 @@ def manifest_group_size(manifest: dict[str, Any], group: str) -> int:
     return total
 
 
+def managed_cache_state_summary(
+    config: dict[str, Any],
+    manifest: dict[str, Any],
+) -> tuple[int, int]:
+    """Return count/bytes for healthy manifest-owned promoted cache entries."""
+    count = 0
+    total = 0
+
+    for source_str, entry in manifest.get("items", {}).items():
+        if not isinstance(entry, dict):
+            continue
+
+        cache_value = str(entry.get("cache") or "")
+        if not cache_value:
+            continue
+
+        source = Path(source_str)
+        cache = Path(cache_value)
+        preserved = Path(
+            entry.get("preserved_original") or original_sidecar_path(source, config)
+        )
+
+        if not source.is_symlink():
+            continue
+        if not cache.exists() or cache.is_symlink() or not cache.is_file():
+            continue
+        if not preserved.exists() or preserved.is_symlink() or not preserved.is_file():
+            continue
+
+        try:
+            raw_target = Path(os.readlink(source))
+            if not raw_target.is_absolute():
+                raw_target = source.parent / raw_target
+            if raw_target.resolve(strict=False) != cache.resolve(strict=False):
+                continue
+
+            cache_size = cache.stat().st_size
+            if preserved.stat().st_size != cache_size:
+                continue
+        except OSError:
+            continue
+
+        count += 1
+        total += cache_size
+
+    return count, total
+
+
+def refresh_promoted_state(
+    config: dict[str, Any],
+    manifest: dict[str, Any],
+    report: RunReport,
+) -> None:
+    count, total = managed_cache_state_summary(config, manifest)
+    report.promoted_state_count = count
+    report.promoted_state_bytes = total
+
+
 def media_group_for_library(library: Library) -> str:
     return "music" if library.kind in MUSIC_KINDS else "video"
 
@@ -301,6 +546,37 @@ def get_video_effective_limit(config: dict[str, Any], max_cache_size: int) -> in
     except Exception:
         reserve_bytes = 0
     return max(max_cache_size - reserve_bytes, 0)
+
+
+def get_demote_after_days_cold(config: dict[str, Any], default: int = 14) -> int:
+    """
+    Return the grace period after an item stops qualifying as hot.
+
+    demote_after_days_cold is the canonical operator-facing name. The older
+    demote_after_days_unwatched key remains a compatibility alias because its
+    behavior was always based on last_seen_hot rather than directly on the
+    Jellyfin LastPlayedDate.
+    """
+    cache_cfg = config.get("cache", {}) or {}
+    if "demote_after_days_cold" in cache_cfg:
+        value = cache_cfg["demote_after_days_cold"]
+    elif "demote_after_days_unwatched" in cache_cfg:
+        value = cache_cfg["demote_after_days_unwatched"]
+    else:
+        value = default
+
+    try:
+        days = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "cache.demote_after_days_cold must be a non-negative integer"
+        ) from exc
+
+    if days < 0:
+        raise RuntimeError(
+            "cache.demote_after_days_cold must be a non-negative integer"
+        )
+    return days
 
 
 def is_video_file(path: Path, extensions: set[str]) -> bool:
@@ -1295,6 +1571,106 @@ def discover_recent_candidates_fallback(
     return []
 
 
+def reconcile_managed_candidate(
+    candidate: Candidate,
+    cache_file: Path,
+    manifest: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    # Reconcile a hot candidate with an existing manifest-managed cache entry.
+    #
+    # Returns ("unmanaged", "") when no manifest entry exists,
+    # ("cached", detail) when manifest and disk state agree, or
+    # ("inconsistent", detail) when a manifest entry exists but is unsafe.
+    #
+    # The manifest remains the ownership boundary. Do not auto-adopt untracked
+    # symlinks or cache files merely because they resemble Hotcache state.
+    items = manifest.setdefault("items", {})
+    source = candidate.source_file
+    source_key = str(source)
+
+    if source_key not in items:
+        return "unmanaged", ""
+
+    entry = items.get(source_key)
+    if not isinstance(entry, dict):
+        return "inconsistent", "manifest entry is not an object"
+
+    entry_cache_value = str(entry.get("cache") or "")
+    if not entry_cache_value:
+        return "inconsistent", "manifest entry is missing cache path"
+
+    entry_cache = Path(entry_cache_value)
+    if logical_path(entry_cache) != logical_path(cache_file):
+        return (
+            "inconsistent",
+            f"manifest cache path {entry_cache} does not match configured cache path {cache_file}",
+        )
+
+    if not source.is_symlink():
+        return "inconsistent", "manifest entry exists but source is not a symlink"
+
+    try:
+        raw_target = Path(os.readlink(source))
+    except OSError as exc:
+        return "inconsistent", f"could not read source symlink: {exc}"
+
+    if not raw_target.is_absolute():
+        raw_target = source.parent / raw_target
+
+    actual_target = raw_target.resolve(strict=False)
+    expected_target = cache_file.resolve(strict=False)
+    if actual_target != expected_target:
+        return (
+            "inconsistent",
+            f"source symlink targets {actual_target}; expected {expected_target}",
+        )
+
+    if not cache_file.exists():
+        return "inconsistent", f"cache file is missing: {cache_file}"
+    if cache_file.is_symlink() or not cache_file.is_file():
+        return "inconsistent", f"cache path is not a regular file: {cache_file}"
+
+    preserved = Path(
+        entry.get("preserved_original") or original_sidecar_path(source, config)
+    )
+    if not preserved.exists() or preserved.is_symlink() or not preserved.is_file():
+        return "inconsistent", f"preserved original is not a regular file: {preserved}"
+
+    try:
+        cache_size = cache_file.stat().st_size
+        preserved_size = preserved.stat().st_size
+    except OSError as exc:
+        return "inconsistent", f"could not stat managed cache state: {exc}"
+
+    if preserved_size != cache_size:
+        return (
+            "inconsistent",
+            f"preserved original size {human_size(preserved_size)} does not match "
+            f"cache size {human_size(cache_size)}",
+        )
+
+    # State is healthy. Normalize mutable metadata from Jellyfin and disk while
+    # preserving the original promotion history.
+    entry["title"] = candidate.title
+    entry["item_id"] = candidate.item_id
+    entry["library"] = candidate.library.name
+    entry["kind"] = candidate.library.kind
+    entry["media_group"] = media_group_for_library(candidate.library)
+    entry["source"] = source_key
+    entry["cache"] = str(cache_file)
+    entry["preserved_original"] = str(preserved)
+    entry["size_bytes"] = cache_size
+    entry["last_seen_hot"] = now_iso()
+    entry["last_played"] = candidate.last_played
+    entry["plays_last_seen"] = candidate.plays
+
+    return (
+        "cached",
+        f"already cached; managed state verified; {candidate.reason}",
+    )
+
+
 def can_promote_file(
     source_file: Path,
     cache_file: Path,
@@ -1470,7 +1846,7 @@ def demote_cold_files(
     if not cache_cfg.get("enable_demotion", False):
         return []
 
-    demote_after_days = int(cache_cfg.get("demote_after_days_unwatched", 90))
+    demote_after_days = get_demote_after_days_cold(config)
     cutoff = dt.datetime.now(dt.timezone.utc).astimezone() - dt.timedelta(days=demote_after_days)
 
     actions: list[Action] = []
@@ -1823,6 +2199,34 @@ def build_libraries(config: dict[str, Any]) -> list[Library]:
     return libraries
 
 
+def apply_cache_removal_projection(
+    report: RunReport,
+    actions: list[Action],
+    libraries: list[Library],
+) -> None:
+    """Apply dry-run demotion/restoration removals to projected cache usage."""
+    removable_statuses = {"DRY-RUN DEMOTE", "DRY-RUN RESTORE"}
+
+    for action in actions:
+        if action.status not in removable_statuses:
+            continue
+
+        size = max(int(action.size_bytes), 0)
+        report.projected_cache_used = max(report.projected_cache_used - size, 0)
+
+        library = find_matching_library(Path(action.source), libraries)
+        if library is None:
+            # A valid manifest should resolve to a configured library. If it
+            # does not, keep the total projection correct and leave category
+            # accounting unchanged rather than guessing.
+            continue
+
+        if media_group_for_library(library) == "music":
+            report.projected_music_used = max(report.projected_music_used - size, 0)
+        else:
+            report.projected_video_used = max(report.projected_video_used - size, 0)
+
+
 def format_action(action: Action) -> str:
     lines = [
         f"  - {action.title}",
@@ -1842,31 +2246,95 @@ def build_report_text(config: dict[str, Any], report: RunReport) -> str:
     projected_total = report.projected_cache_used or report.cache_used_after
     music_limit = get_music_cache_limit(config)
     video_limit = get_video_effective_limit(config, report.cache_limit)
+    demotion_enabled = bool(config.get("cache", {}).get("enable_demotion", False))
+    demote_after_days = get_demote_after_days_cold(config)
+    (
+        policy_remaining,
+        filesystem_available,
+        minimum_free,
+        projected_growth,
+        effective_remaining,
+    ) = calculate_capacity_remaining(config, report)
+
     lines = [
         f"Jellyfin Hot Cache Report - {report.started_at}",
         "",
-        "Cache status:",
-        f"  Cache path:         {cache_root}",
-        f"  Configured limit:   {human_size(report.cache_limit)}",
-        f"  Used before:        {human_size(report.cache_used_before)}",
-        f"  Used after:         {human_size(report.cache_used_after)}",
-        f"  Projected used:     {human_size(projected_total)}",
-        f"  Remaining allowed:  {human_size(max(report.cache_limit - projected_total, 0))}",
-        f"  Music limit:        {human_size(music_limit)}",
-        f"  Music projected:    {human_size(report.projected_music_used)}",
-        f"  Music remaining:    {human_size(max(music_limit - report.projected_music_used, 0))}",
-        f"  Video limit:        {human_size(video_limit)}",
-        f"  Video projected:    {human_size(report.projected_video_used)}",
-        f"  Video remaining:    {human_size(max(video_limit - report.projected_video_used, 0))}",
-        f"  Filesystem free:    {human_size(report.filesystem_free)}",
-        f"  Dry run:            {report.dry_run}",
-        "",
+        "Filesystem:",
     ]
 
+    filesystem = report.filesystem_info
+    if filesystem is None:
+        lines.extend(
+            [
+                "  Type:                 unknown",
+                f"  Available:            {human_size(filesystem_available)}",
+            ]
+        )
+    else:
+        fs_type = "ZFS" if filesystem.fs_type.lower() == "zfs" else filesystem.fs_type
+        lines.append(f"  Type:                 {fs_type or 'unknown'}")
+
+        if filesystem.fs_type.lower() == "zfs":
+            lines.append(f"  Dataset:              {filesystem.dataset or filesystem.source or 'unknown'}")
+            lines.append(f"  Pool:                 {filesystem.pool or 'unknown'}")
+            if filesystem.zfs_details_available:
+                lines.extend(
+                    [
+                        f"  Pool free:            {_format_optional_bytes(filesystem.zpool_free, 'unknown')}",
+                        f"  Dataset quota:        {_format_optional_bytes(filesystem.zfs_quota)}",
+                        f"  Dataset refquota:     {_format_optional_bytes(filesystem.zfs_refquota)}",
+                        f"  Dataset used:         {human_size(filesystem.zfs_used or 0)}",
+                        f"  Dataset referenced:   {human_size(filesystem.zfs_referenced or 0)}",
+                        f"  Dataset available:    {human_size(filesystem.zfs_available or 0)}",
+                    ]
+                )
+            else:
+                lines.append(f"  Available:            {human_size(filesystem.available)}")
+        else:
+            if filesystem.source:
+                lines.append(f"  Source:               {filesystem.source}")
+            if filesystem.mountpoint:
+                lines.append(f"  Mountpoint:           {filesystem.mountpoint}")
+            lines.append(f"  Available:            {human_size(filesystem.available)}")
+
+        if filesystem.warning:
+            lines.append(f"  Metadata warning:     {filesystem.warning}")
+
+    lines.extend(
+        [
+            "",
+            "Hotcache:",
+            f"  Cache path:           {cache_root}",
+            f"  Configured limit:     {human_size(report.cache_limit)}",
+            f"  Used before:          {human_size(report.cache_used_before)}",
+            f"  Used after:           {human_size(report.cache_used_after)}",
+            f"  Projected used:       {human_size(projected_total)}",
+            f"  Remaining by policy:  {human_size(policy_remaining)}",
+            f"  Music limit:          {human_size(music_limit)}",
+            f"  Music projected:      {human_size(report.projected_music_used)}",
+            f"  Music remaining:      {human_size(max(music_limit - report.projected_music_used, 0))}",
+            f"  Video limit:          {human_size(video_limit)}",
+            f"  Video projected:      {human_size(report.projected_video_used)}",
+            f"  Video remaining:      {human_size(max(video_limit - report.projected_video_used, 0))}",
+            f"  Filesystem available: {human_size(filesystem_available)}",
+            f"  Required free reserve: {human_size(minimum_free)}",
+            f"  Projected growth:     {human_size(projected_growth)}",
+            f"  Effective remaining:  {human_size(effective_remaining)}",
+            f"  Demotion enabled:     {demotion_enabled}",
+            f"  Demote after cold:    {demote_after_days} days",
+            f"  Promoted files:       {report.promoted_state_count}",
+            f"  Promoted size:        {human_size(report.promoted_state_bytes)}",
+            f"  Hot already promoted: {report.hot_already_promoted_count}",
+            f"  Uncached candidates:  {len(report.candidates)}",
+            f"  Dry run:              {report.dry_run}",
+            "",
+        ]
+    )
+
     sections = [
-        ("Promoted", report.promoted),
-        ("Demoted", report.demoted),
-        ("Restored", report.restored),
+        ("Promoted this run", report.promoted),
+        ("Demoted this run", report.demoted),
+        ("Restored this run", report.restored),
         ("Skipped", report.skipped),
         ("Candidates", report.candidates),
     ]
@@ -1904,7 +2372,15 @@ def send_report(config: dict[str, Any], body: str, started_at: str) -> None:
 
     send_empty = bool(reporting.get("send_empty_report", True))
     if not send_empty:
-        if all(marker in body for marker in ["Promoted:\n  - None", "Demoted:\n  - None", "Restored:\n  - None", "Skipped:\n  - None"]):
+        if all(
+            marker in body
+            for marker in [
+                "Promoted this run:\n  - None",
+                "Demoted this run:\n  - None",
+                "Restored this run:\n  - None",
+                "Skipped:\n  - None",
+            ]
+        ):
             return
 
     msg = EmailMessage()
@@ -2146,6 +2622,16 @@ def run_preflight(config: dict[str, Any]) -> int:
             _check_result(results, "PASS", f"library {library.name}", str(library.source))
 
     cache_cfg = config["cache"]
+    demote_after_days = get_demote_after_days_cold(config)
+    _check_result(
+        results,
+        "PASS",
+        "demotion policy",
+        (
+            f"{'enabled' if cache_cfg.get('enable_demotion', False) else 'disabled'}; "
+            f"{demote_after_days} days after an item stops qualifying as hot"
+        ),
+    )
     cache_root = Path(cache_cfg["root"])
     cache_available = False
     if not cache_root.exists():
@@ -2156,19 +2642,57 @@ def run_preflight(config: dict[str, Any]) -> int:
         _check_result(results, "FAIL", "cache root", f"not readable/writable: {cache_root}")
     else:
         cache_available = True
-        usage = shutil.disk_usage(cache_root)
+        filesystem = inspect_filesystem(cache_root)
         used = directory_size(cache_root)
         limit = parse_size(cache_cfg.get("max_cache_size", "50GB"))
         minimum_free = parse_size(cache_cfg.get("minimum_free_cache_space", "5GB"))
         _check_result(results, "PASS", "cache root", str(cache_root))
+        _check_result(
+            results,
+            "PASS",
+            "filesystem",
+            (
+                f"{'ZFS' if filesystem.fs_type.lower() == 'zfs' else filesystem.fs_type or 'unknown'}"
+                + (f" {filesystem.source}" if filesystem.source else "")
+            ),
+        )
+        if filesystem.fs_type.lower() == "zfs":
+            if filesystem.zfs_details_available:
+                _check_result(
+                    results,
+                    "PASS",
+                    "ZFS capacity",
+                    (
+                        f"{filesystem.dataset}; available {human_size(filesystem.available)}; "
+                        f"quota {_format_optional_bytes(filesystem.zfs_quota)}; "
+                        f"refquota {_format_optional_bytes(filesystem.zfs_refquota)}"
+                    ),
+                )
+                if filesystem.warning:
+                    _check_result(results, "WARN", "ZFS pool metadata", filesystem.warning)
+            else:
+                _check_result(
+                    results,
+                    "WARN",
+                    "ZFS capacity",
+                    filesystem.warning or "ZFS properties unavailable",
+                )
+        elif filesystem.warning:
+            _check_result(results, "WARN", "filesystem metadata", filesystem.warning)
+
         if used > limit:
             _check_result(results, "FAIL", "cache limit", f"used {human_size(used)} exceeds limit {human_size(limit)}")
         else:
             _check_result(results, "PASS", "cache limit", f"used {human_size(used)} of {human_size(limit)}")
-        if usage.free < minimum_free:
-            _check_result(results, "FAIL", "cache free space", f"{human_size(usage.free)} free; requires {human_size(minimum_free)}")
+        if filesystem.available < minimum_free:
+            _check_result(
+                results,
+                "FAIL",
+                "cache free space",
+                f"{human_size(filesystem.available)} available; requires {human_size(minimum_free)}",
+            )
         else:
-            _check_result(results, "PASS", "cache free space", human_size(usage.free))
+            _check_result(results, "PASS", "cache free space", human_size(filesystem.available))
 
         try:
             cache_dev = cache_root.stat().st_dev
@@ -2293,6 +2817,7 @@ def validate_config(config: dict[str, Any]) -> None:
             cursor = cursor[key]
 
     cache_cfg = config["cache"]
+    get_demote_after_days_cold(config)
     if cache_cfg.get("allow_directory_promotion", False):
         raise RuntimeError(
             "allow_directory_promotion is true. This script is intentionally "
@@ -2390,12 +2915,14 @@ def main() -> int:
     manifest = load_manifest(manifest_path)
 
     initial_cache_used = directory_size(cache_root)
+    filesystem_info = inspect_filesystem(cache_root)
     report = RunReport(
         started_at=started_at,
         dry_run=dry_run,
         cache_used_before=initial_cache_used,
         cache_limit=max_cache_size,
-        filesystem_free=shutil.disk_usage(cache_root).free,
+        filesystem_free=filesystem_info.available,
+        filesystem_info=filesystem_info,
         projected_cache_used=initial_cache_used,
         projected_music_used=manifest_group_size(manifest, "music"),
         projected_video_used=manifest_group_size(manifest, "video"),
@@ -2419,7 +2946,11 @@ def main() -> int:
 
             report.cache_used_after = directory_size(cache_root)
             report.projected_cache_used = report.cache_used_after
-            report.filesystem_free = shutil.disk_usage(cache_root).free
+            if not dry_run:
+                report.projected_music_used = manifest_group_size(manifest, "music")
+                report.projected_video_used = manifest_group_size(manifest, "video")
+            refresh_report_filesystem(report, cache_root)
+            refresh_promoted_state(config, manifest, report)
 
             if not dry_run:
                 save_manifest(manifest_path, manifest)
@@ -2464,18 +2995,27 @@ def main() -> int:
 
         candidates = dedupe_candidates(candidates)
 
-        hot_sources = {str(c.source_file): c for c in candidates}
-        for source_str, entry in manifest.setdefault("items", {}).items():
-            if source_str in hot_sources:
-                entry["last_seen_hot"] = now_iso()
-                entry["last_played"] = hot_sources[source_str].last_played
-
         projected_cache_used = report.projected_cache_used
         projected_music_used = report.projected_music_used
         projected_video_used = report.projected_video_used
 
         for candidate in candidates:
             cache_file = build_cache_path(cache_root, candidate)
+
+            managed_state, managed_reason = reconcile_managed_candidate(
+                candidate=candidate,
+                cache_file=cache_file,
+                manifest=manifest,
+                config=config,
+            )
+
+            if managed_state == "cached":
+                # Already promoted is current cache state, not a candidate and
+                # not a promotion action. Reconciliation above refreshed the
+                # manifest only after verifying source/cache/original state.
+                report.hot_already_promoted_count += 1
+                continue
+
             report.candidates.append(
                 Action(
                     status="CANDIDATE",
@@ -2486,6 +3026,51 @@ def main() -> int:
                     reason=candidate.reason,
                 )
             )
+
+            if managed_state == "inconsistent":
+                report.skipped.append(
+                    Action(
+                        status="SKIPPED PROMOTE",
+                        title=candidate.title,
+                        source=str(candidate.source_file),
+                        cache=str(cache_file),
+                        size_bytes=candidate.size_bytes,
+                        reason=f"managed cache state is inconsistent: {managed_reason}",
+                    )
+                )
+                continue
+
+            if candidate.source_file.is_symlink():
+                report.skipped.append(
+                    Action(
+                        status="SKIPPED PROMOTE",
+                        title=candidate.title,
+                        source=str(candidate.source_file),
+                        cache=str(cache_file),
+                        size_bytes=candidate.size_bytes,
+                        reason=(
+                            "source is a symlink but has no manifest entry; "
+                            "refusing automatic adoption"
+                        ),
+                    )
+                )
+                continue
+
+            if cache_file.exists():
+                report.skipped.append(
+                    Action(
+                        status="SKIPPED PROMOTE",
+                        title=candidate.title,
+                        source=str(candidate.source_file),
+                        cache=str(cache_file),
+                        size_bytes=candidate.size_bytes,
+                        reason=(
+                            "cache destination exists but has no manifest entry; "
+                            "refusing automatic adoption"
+                        ),
+                    )
+                )
+                continue
 
             ok, reason = can_promote_file(
                 source_file=candidate.source_file,
@@ -2565,13 +3150,27 @@ def main() -> int:
                     report.demoted.append(action)
                 else:
                     report.skipped.append(action)
+
+            if dry_run:
+                apply_cache_removal_projection(report, demote_actions, libraries)
+                projected_cache_used = report.projected_cache_used
+                projected_music_used = report.projected_music_used
+                projected_video_used = report.projected_video_used
         except Exception as exc:
             report.errors.append(f"Demotion failed: {exc}")
 
         report.cache_used_after = directory_size(cache_root)
-        if not report.projected_cache_used:
+        if dry_run:
+            if not report.projected_cache_used:
+                report.projected_cache_used = report.cache_used_after
+        else:
+            # Real demotions and promotions have already happened. Report the
+            # state that is actually on disk/in the updated manifest rather
+            # than retaining a pre-demotion projection.
             report.projected_cache_used = report.cache_used_after
-        report.filesystem_free = shutil.disk_usage(cache_root).free
+            report.projected_music_used = manifest_group_size(manifest, "music")
+            report.projected_video_used = manifest_group_size(manifest, "video")
+        refresh_report_filesystem(report, cache_root)
 
         if not dry_run:
             save_manifest(manifest_path, manifest)
@@ -2582,7 +3181,8 @@ def main() -> int:
     report.cache_used_after = directory_size(cache_root)
     if not report.projected_cache_used:
         report.projected_cache_used = report.cache_used_after
-    report.filesystem_free = shutil.disk_usage(cache_root).free
+    refresh_report_filesystem(report, cache_root)
+    refresh_promoted_state(config, manifest, report)
 
     return finish_run(config, report, started_at, args.no_email)
 

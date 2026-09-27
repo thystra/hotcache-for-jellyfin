@@ -23,6 +23,15 @@ Read configuration from
 The default is
 .IR /etc/jellyfin-hotcache/config.yml .
 .TP
+.BR \-\-environment-file " " FILE
+Read optional environment variables from
+.IR FILE .
+The default is
+.IR /etc/jellyfin-hotcache/environment .
+Existing process environment variables take precedence. The file uses simple
+.B NAME=value
+entries and is not executed as shell code.
+.TP
 .B \-\-check
 Run the read-only preflight and exit. The preflight checks configuration,
 Jellyfin API access, playback database connectivity and schema, configured
@@ -47,6 +56,7 @@ Optional operator-owned environment file for secrets such as
 .B JELLYFIN_API_KEY
 and
 .BR JELLYFIN_PG_PASSWORD .
+It is read automatically by the CLI unless another file is selected.
 .TP
 .I /usr/share/jellyfin-hotcache/config.yml.example
 Package-managed reference configuration.

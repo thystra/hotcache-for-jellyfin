@@ -1,3 +1,15 @@
+jellyfin-hotcache (1.0.3-1) unstable; urgency=medium
+
+  * Add the application version to every report and expose --version.
+  * Report promotion decisions as mutually exclusive final states.
+  * Keep capacity-limited media waiting for space instead of marking it skipped.
+  * Report active streams as deferred and policy exclusions separately.
+  * Route inconsistent or untracked cache state to operator attention.
+  * Stop listing successfully promoted or already-cached media as candidates.
+  * Extend state-reporting regression coverage and operator documentation.
+
+ -- Alan Johnson <alan@argentwolf.org>  Tue, 29 Sep 2026 10:43:09 +0000
+
 jellyfin-hotcache (1.0.2-1) unstable; urgency=medium
 
   * Detect whether Jellyfin runs on bare metal or in an isolated container.

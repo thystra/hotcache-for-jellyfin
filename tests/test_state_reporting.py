@@ -61,11 +61,9 @@ def test_managed_cache_state_summary_excludes_broken_state(
     assert size == 0
 
 
-def test_report_distinguishes_state_actions_and_candidates(
-    hotcache, base_config
-):
+def test_report_uses_mutually_exclusive_final_states(hotcache, base_config):
     report = hotcache.RunReport(
-        started_at="2026-09-27T09:00:00-04:00",
+        started_at="2026-09-29T06:33:53-04:00",
         dry_run=True,
         cache_limit=190 * 1024**3,
         cache_used_before=10 * 1024**3,
@@ -79,29 +77,87 @@ def test_report_distinguishes_state_actions_and_candidates(
     report.promoted.append(
         hotcache.Action(
             status="DRY-RUN PROMOTE",
-            title="New Movie",
-            source="/library/New Movie.mkv",
-            cache="/cache/New Movie.mkv",
+            title="Promoted Movie",
+            source="/library/Promoted Movie.mkv",
+            cache="/cache/Promoted Movie.mkv",
             size_bytes=1,
             reason="eligible",
         )
     )
-    report.candidates.append(
+    report.waiting_for_space.append(
         hotcache.Action(
-            status="CANDIDATE",
-            title="New Movie",
-            source="/library/New Movie.mkv",
-            cache="/cache/New Movie.mkv",
+            status="WAITING FOR SPACE",
+            title="Waiting Movie",
+            source="/library/Waiting Movie.mkv",
+            cache="/cache/Waiting Movie.mkv",
             size_bytes=1,
-            reason="eligible",
+            reason="video cache limit exceeded",
+        )
+    )
+    report.deferred.append(
+        hotcache.Action(
+            status="DEFERRED",
+            title="Active Movie",
+            source="/library/Active Movie.mkv",
+            cache="/cache/Active Movie.mkv",
+            size_bytes=1,
+            reason="file is currently being streamed",
+        )
+    )
+    report.blocked_by_policy.append(
+        hotcache.Action(
+            status="BLOCKED BY POLICY",
+            title="Oversized Movie",
+            source="/library/Oversized Movie.mkv",
+            cache="/cache/Oversized Movie.mkv",
+            size_bytes=1,
+            reason="file exceeds max_single_file_promotion_size",
+        )
+    )
+    report.attention_required.append(
+        hotcache.Action(
+            status="ATTENTION REQUIRED",
+            title="Inconsistent Movie",
+            source="/library/Inconsistent Movie.mkv",
+            cache="/cache/Inconsistent Movie.mkv",
+            size_bytes=1,
+            reason="managed cache state is inconsistent",
         )
     )
 
     text = hotcache.build_report_text(base_config, report)
 
+    assert f"Version: {hotcache.HOTCACHE_VERSION}" in text
     assert "Promoted files:       3" in text
     assert "Hot already promoted: 3" in text
-    assert "Uncached candidates:  1" in text
+    assert "Pending candidates:   2" in text
+    assert "Waiting for space:    1" in text
+    assert "Deferred:             1" in text
+    assert "Blocked by policy:    1" in text
+    assert "Attention required:   1" in text
     assert "Promoted this run:" in text
-    assert "Candidates:" in text
-    assert "CACHED HOT" not in text
+    assert "Waiting for space:" in text
+    assert "Deferred:" in text
+    assert "Blocked by policy:" in text
+    assert "Attention required:" in text
+    assert "Candidates:" not in text
+    assert "Uncached candidates:" not in text
+    assert text.count("Promoted Movie") == 3  # title, source, cache in one final-state section
+
+
+def test_promotion_outcome_classification(hotcache):
+    assert hotcache.classify_promotion_outcome(
+        "file is currently being streamed"
+    ) == "deferred"
+    assert hotcache.classify_promotion_outcome(
+        "video cache limit exceeded after reserving music space"
+    ) == "waiting_for_space"
+    assert hotcache.classify_promotion_outcome(
+        "filesystem free-space floor exceeded: free 1 GiB"
+    ) == "waiting_for_space"
+    assert hotcache.classify_promotion_outcome(
+        "file exceeds max_single_file_promotion_size: 40 GiB"
+    ) == "blocked_by_policy"
+    assert hotcache.classify_promotion_outcome(
+        "source file does not exist"
+    ) == "attention_required"

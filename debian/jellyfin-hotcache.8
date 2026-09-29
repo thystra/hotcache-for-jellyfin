@@ -1,4 +1,4 @@
-.TH JELLYFIN-HOTCACHE 8 "September 2026" "jellyfin-hotcache 1.0.1" "System Administration"
+.TH JELLYFIN-HOTCACHE 8 "September 2026" "jellyfin-hotcache 1.0.3" "System Administration"
 .SH NAME
 jellyfin\-hotcache \- manage a safety-oriented local media cache for Jellyfin
 .SH SYNOPSIS
@@ -16,6 +16,9 @@ history cannot be checked. The configured cache root must already exist; the
 program will not create a missing cache root because that can conceal a missing
 mount.
 .SH OPTIONS
+.TP
+.B \-\-version
+Print the running jellyfin-hotcache application version and exit.
 .TP
 .BR \-\-config " " FILE
 Read configuration from
@@ -46,6 +49,27 @@ Force dry-run behavior regardless of the configuration setting.
 .TP
 .B \-\-no-email
 Do not send the run report by email.
+.SH PROMOTION REPORTING
+Items that meet their configured play threshold are reconciled against managed
+cache state before promotion is considered. Healthy already-cached items are
+reported only in the Hotcache state summary and are not promotion candidates.
+.PP
+An uncached qualifying item has one final promotion state for each run:
+.B PROMOTED
+when promotion succeeds,
+.B WAITING FOR SPACE
+when cache or filesystem capacity is insufficient,
+.B DEFERRED
+when an active stream makes promotion temporarily unsafe,
+.B BLOCKED BY POLICY
+when a configured promotion limit excludes the item, or
+.B ATTENTION REQUIRED
+when cache/manifest/source state is inconsistent or a promotion fails.
+Items below the configured promotion threshold are monitored silently and are
+not included in the daily report.
+.PP
+Every run report includes the jellyfin-hotcache application version that
+produced it.
 .SH CACHE AGING
 The
 .B cache.hot_window_days

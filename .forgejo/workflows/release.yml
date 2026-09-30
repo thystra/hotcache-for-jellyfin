@@ -1,0 +1,163 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-release:
+    runs-on: forgejo-workstation
+    env:
+      SOURCE_REF: ${{ forgejo.ref }}
+      SOURCE_SHA: ${{ forgejo.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Debian build tooling
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            debhelper \
+            dpkg-dev \
+            fakeroot \
+            lintian \
+            python3 \
+            python3-pytest \
+            python3-yaml
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Validate release versions
+        id: version
+        run: |
+          set -euo pipefail
+
+          package_version="$(dpkg-parsechangelog -S Version)"
+          version_no_epoch="${package_version#*:}"
+          upstream_version="${version_no_epoch%-*}"
+          app_version="$(./jellyfin-hotcache --version | awk '{print $NF}')"
+
+          echo "Application version: ${app_version}"
+          echo "Debian package version: ${package_version}"
+          echo "Source ref: ${SOURCE_REF}"
+          echo "Source commit: ${SOURCE_SHA}"
+
+          if [ "${app_version}" != "${upstream_version}" ]; then
+            echo "Application version ${app_version} does not match Debian upstream version ${upstream_version}" >&2
+            exit 1
+          fi
+
+          case "${SOURCE_REF}" in
+            refs/tags/*)
+              tag_name="${SOURCE_REF#refs/tags/}"
+              case "${tag_name}" in
+                v*) tag_version="${tag_name#v}" ;;
+                *)
+                  echo "Release tag must begin with v: ${tag_name}" >&2
+                  exit 1
+                  ;;
+              esac
+              if [ "${tag_version}" != "${upstream_version}" ]; then
+                echo "Tag version ${tag_version} does not match application version ${upstream_version}" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Manual rehearsal build: no tag/version comparison required."
+              ;;
+          esac
+
+          echo "package_version=${package_version}" >> "${FORGEJO_OUTPUT}"
+          echo "upstream_version=${upstream_version}" >> "${FORGEJO_OUTPUT}"
+          echo "app_version=${app_version}" >> "${FORGEJO_OUTPUT}"
+
+      - name: Build Debian package
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          dpkg-buildpackage -us -uc -b
+
+      - name: Validate package and prepare release artifacts
+        run: |
+          set -euo pipefail
+
+          package_version="${{ steps.version.outputs.package_version }}"
+          upstream_version="${{ steps.version.outputs.upstream_version }}"
+          build_arch="$(dpkg-architecture -qDEB_BUILD_ARCH)"
+
+          deb="../jellyfin-hotcache_${package_version}_all.deb"
+          buildinfo="../jellyfin-hotcache_${package_version}_${build_arch}.buildinfo"
+          changes="../jellyfin-hotcache_${package_version}_${build_arch}.changes"
+
+          test -f "${deb}"
+          test -f "${buildinfo}"
+          test -f "${changes}"
+
+          test "$(dpkg-deb -f "${deb}" Package)" = "jellyfin-hotcache"
+          test "$(dpkg-deb -f "${deb}" Version)" = "${package_version}"
+          test "$(dpkg-deb -f "${deb}" Architecture)" = "all"
+
+          payload_root="$(mktemp -d)"
+          trap 'rm -rf "${payload_root}"' EXIT
+          dpkg-deb -x "${deb}" "${payload_root}"
+          payload_version="$("${payload_root}/usr/sbin/jellyfin-hotcache" --version | awk '{print $NF}')"
+          test "${payload_version}" = "${upstream_version}"
+
+          lintian --fail-on error "${changes}"
+
+          artifact_dir="release-artifacts"
+          rm -rf "${artifact_dir}"
+          mkdir -p "${artifact_dir}"
+
+          cp "${deb}" "${buildinfo}" "${changes}" "${artifact_dir}/"
+
+          manifest="${artifact_dir}/jellyfin-hotcache-${upstream_version}-RELEASE-MANIFEST.txt"
+          cat > "${manifest}" <<EOF
+          Product: jellyfin-hotcache
+          Application-Version: ${upstream_version}
+          Debian-Package-Version: ${package_version}
+          Package-Architecture: all
+          Build-Architecture: ${build_arch}
+          Source-Ref: ${SOURCE_REF}
+          Source-Commit: ${SOURCE_SHA}
+          Build-UTC: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          Artifacts:
+            jellyfin-hotcache_${package_version}_all.deb
+            jellyfin-hotcache_${package_version}_${build_arch}.buildinfo
+            jellyfin-hotcache_${package_version}_${build_arch}.changes
+          EOF
+
+          (
+            cd "${artifact_dir}"
+            sha256sum \
+              "jellyfin-hotcache_${package_version}_all.deb" \
+              "jellyfin-hotcache_${package_version}_${build_arch}.buildinfo" \
+              "jellyfin-hotcache_${package_version}_${build_arch}.changes" \
+              "jellyfin-hotcache-${upstream_version}-RELEASE-MANIFEST.txt" \
+              > "jellyfin-hotcache-${upstream_version}-SHA256SUMS"
+          )
+
+          echo
+          echo "Prepared release artifacts:"
+          ls -lh "${artifact_dir}"
+          echo
+          cat "${manifest}"
+          echo
+          cat "${artifact_dir}/jellyfin-hotcache-${upstream_version}-SHA256SUMS"
+
+      - name: Upload release artifact set
+        uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-hotcache-${{ steps.version.outputs.package_version }}-release
+          path: release-artifacts/
+          if-no-files-found: error
+          retention-days: 90

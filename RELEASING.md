@@ -68,3 +68,11 @@ The release workflow fails if any of the following is true:
 Forgejo workflow artifacts are staging artifacts, not the permanent release
 distribution. Attach the verified files to the Forgejo release after the tagged
 build succeeds.
+
+The workflow artifact is intentionally temporary and uses the Forgejo Actions
+artifact-retention policy (90 days in this workflow/instance configuration).
+That expiration applies only to the copy attached to the Actions workflow run.
+Files subsequently attached to the Forgejo Release are release attachments,
+not Actions artifacts, and are not governed by the Actions artifact-retention
+timer. They remain part of the release until the release or its attachments are
+explicitly removed.

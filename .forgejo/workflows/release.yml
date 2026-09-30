@@ -155,7 +155,9 @@ jobs:
           cat "${artifact_dir}/jellyfin-hotcache-${upstream_version}-SHA256SUMS"
 
       - name: Upload release artifact set
-        uses: actions/upload-artifact@v4
+        # Use Forgejo's patched v4 artifact action. Upstream GitHub v4 rejects
+        # self-hosted forges as GHES.
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: jellyfin-hotcache-${{ steps.version.outputs.package_version }}-release
           path: release-artifacts/

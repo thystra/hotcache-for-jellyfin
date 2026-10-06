@@ -177,11 +177,11 @@ database initialized by the official Jellyfin container. To run the container
 integration test manually:
 
 ```bash
-./tests/run-jellyfin-sqlite-integration.sh jellyfin/jellyfin:12.1
+./tests/run-jellyfin-sqlite-integration.sh jellyfin/jellyfin:12.2
 ```
 
-CI exercises Jellyfin 10.11.11 and 12.1 so schema compatibility is checked
-across the final 10.11 release and the current 12.x line.
+CI exercises Jellyfin 10.11.11, 12.1, and 12.2 so schema compatibility is
+checked across the final 10.11 release and both qualified 12.x releases.
 
 
 ## Managed cache reconciliation
